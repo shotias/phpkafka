@@ -4,7 +4,8 @@ declare(strict_types=1);
 
 namespace longlang\phpkafka\Protocol;
 
-use Google\CRC32\CRC32;
+// Modified by shotias on 2026-10-05: use native CRC32C on PHP 8.4+. See FORK.md.
+
 use longlang\phpkafka\Protocol\Type\Int32;
 use longlang\phpkafka\Protocol\Type\Int64;
 use longlang\phpkafka\Protocol\Type\UInt32;
@@ -17,11 +18,6 @@ class ProtocolUtil
      * @var bool
      */
     private static $nativeIsBigEndian;
-
-    /**
-     * @var \Google\CRC32\CRCInterface|null
-     */
-    private static $crc32;
 
     public static function nativeIsBigEndian(): bool
     {
@@ -105,22 +101,6 @@ class ProtocolUtil
 
     public static function crc32c(string $data, bool $rawOutput = false): string
     {
-        if (\PHP_VERSION_ID >= 70400) {
-            $result = hash('crc32c', $data, $rawOutput);
-        } else {
-            if (self::$crc32) {
-                $crc32 = self::$crc32;
-            } else {
-                /** @var \Google\CRC32\CRCInterface $crc32 */
-                // @phpstan-ignore-next-line
-                $crc32 = self::$crc32 = CRC32::create(CRC32::CASTAGNOLI);
-            }
-            $crc32->update($data);
-
-            $result = $crc32->hash($rawOutput);
-            $crc32->reset();
-        }
-
-        return $result;
+        return hash('crc32c', $data, $rawOutput);
     }
 }

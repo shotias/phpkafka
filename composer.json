@@ -1,10 +1,10 @@
 {
+    "_comment": ["Modified by shotias on 2026-10-05: require PHP 8.4+ and remove the obsolete google/crc32 dependency. See FORK.md."],
     "name": "longlang/phpkafka",
     "description": "A kafka client. Support php-fpm and Swoole.",
     "license": "Apache-2.0",
     "require": {
-        "php": ">=7.1",
-        "google/crc32": "^0.1.0",
+        "php": ">=8.4",
         "exussum12/xxhash": "^1.0.0",
         "chdemko/sorted-collections": "^1.0",
         "symfony/polyfill-php81": "^1.23"
