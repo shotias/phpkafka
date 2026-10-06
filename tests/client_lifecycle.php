@@ -108,12 +108,17 @@ final class FaultSocket extends SwooleSocket {
     public mixed $writeControl = null;
     public bool $open = true;
     public int $connects = 0;
+    public ?Throwable $closeFailure = null;
     public Channel $input;
     public function __construct(string $host, int $port, ?CommonConfig $config = null) {
         parent::__construct($host, $port, $config); $this->input = new Channel(16);
     }
     public function connect(): void { ++$this->connects; $this->open = true; $this->input = new Channel(16); }
-    public function close(): bool { $this->open = false; $this->input->close(); return true; }
+    public function close(): bool {
+        $this->open = false; $this->input->close();
+        if ($this->closeFailure !== null) { throw $this->closeFailure; }
+        return true;
+    }
     public function isConnected(): bool { return $this->open; }
     public function send(string $data, ?float $timeout = null): int {
         if ($this->writeControl instanceof Closure) { return ($this->writeControl)($data); }
@@ -129,6 +134,14 @@ final class FaultSocket extends SwooleSocket {
 }
 function explicitHeader(int $id): RequestHeader {
     return (new RequestHeader())->setRequestApiKey(18)->setRequestApiVersion(1)->setCorrelationId($id);
+}
+// Weak references observe constructor ownership without keeping a client alive.
+final class ConstructorObservedClient extends SwooleClient {
+    public static array $weak = [];
+    public function __construct(string $host, int $port, ?CommonConfig $config = null, string $socketClass = SwooleSocket::class) {
+        parent::__construct($host, $port, $config, $socketClass);
+        self::$weak[] = WeakReference::create($this);
+    }
 }
 Coroutine\run(static function (): void {
     $baseline = Coroutine::stats()['coroutine_num'];
@@ -198,6 +211,34 @@ Coroutine\run(static function (): void {
         refuses(fn () => $client->send(new ApiVersionsRequest()), 'Swoole failed/short write');
         clean($client, 'Swoole failed/short write');
         verify(!$client->getSocket()->isConnected(), 'Swoole failed/short write closes socket');
+    }
+    foreach (['send', 'recv', 'receiver'] as $stage) {
+        $callbackError = null;
+        $config = (new CommonConfig())->setRecvTimeout(0.08);
+        $config->setExceptionCallback(static function (Throwable $error) use (&$callbackError): void { $callbackError = $error; });
+        $client = new SwooleClient('unused', 1, $config, FaultSocket::class);
+        $socket = $client->getSocket();
+        $primary = new Error('Swoole primary ' . $stage);
+        $socket->closeFailure = new LogicException('Swoole cleanup');
+        if ($stage === 'send') {
+            $socket->writeControl = $primary;
+            $call = fn () => $client->send(new ApiVersionsRequest());
+        } else {
+            $id = $client->send(new ApiVersionsRequest());
+            if ($stage === 'recv') {
+                field($client, 'recvChannels')[$id]->push($primary);
+            } else {
+                $socket->input->push($primary);
+            }
+            $call = fn () => $client->recv($id);
+        }
+        verify(refuses($call, 'Swoole nested failure ' . $stage, Error::class) === $primary, 'Swoole original error object ' . $stage);
+        clean($client, 'Swoole nested cleanup ' . $stage);
+        stopped($client, 'Swoole nested cleanup ' . $stage);
+        verify(!$socket->isConnected(), 'Swoole nested cleanup disconnects ' . $stage);
+        if ($stage === 'receiver') { verify($callbackError === $primary, 'Receiver callback receives original error despite cleanup failure'); }
+        verify(refuses(fn () => $client->close(), 'Explicit Swoole close failure', LogicException::class) === $socket->closeFailure, 'Explicit Swoole cleanup remains visible');
+        $socket->closeFailure = null; $client->close();
     }
     // Suspend an old-generation send, close/reconnect and reuse the public ID.
     // Its late failure must not erase the new registration or close the new socket.
@@ -366,6 +407,53 @@ Coroutine\run(static function (): void {
         if ($result instanceof Throwable) { throw $result; }
         verify($result === true && !Coroutine::exists($server), 'Native ownership peer is joined');
     }
+    // Native constructor, multiplexed client and TCP peer; only wire replies are scripted.
+    ConstructorObservedClient::$weak = [];
+    peer(static function (Socket $socket, Channel $finish): void {
+        $versions = (new ApiVersionsResponse())->setApiKeys([
+            (new \longlang\phpkafka\Protocol\ApiVersions\ApiVersionsResponseKey())->setApiKey(3)->setMinVersion(0)->setMaxVersion(0),
+            (new \longlang\phpkafka\Protocol\ApiVersions\ApiVersionsResponseKey())->setApiKey(10)->setMinVersion(0)->setMaxVersion(0),
+        ]);
+        writeFrame($socket, Int32::pack(readId($socket)) . $versions->pack(1));
+        $metadata = (new \longlang\phpkafka\Protocol\Metadata\MetadataResponse())->setTopics([
+            (new \longlang\phpkafka\Protocol\Metadata\MetadataResponseTopic())->setName('constructor-probe'),
+        ]);
+        writeFrame($socket, Int32::pack(readId($socket)) . $metadata->pack(0));
+        for ($attempt = 0; $attempt < 2; ++$attempt) {
+            $failure = (new \longlang\phpkafka\Protocol\FindCoordinator\FindCoordinatorResponse())->setErrorCode(15);
+            writeFrame($socket, Int32::pack(readId($socket)) . $failure->pack(0));
+        }
+        $finish->pop(1);
+    }, static function (SwooleClient $unused): void {
+        $config = new \longlang\phpkafka\Consumer\ConsumerConfig();
+        $config->setClient(ConstructorObservedClient::class); $config->setSocket(SwooleSocket::class);
+        $config->setTimer(\longlang\phpkafka\Timer\SwooleTimer::class); $config->setUpdateBrokers(false);
+        $config->setBroker([1 => 'tcp://' . $unused->getHost() . ':' . $unused->getPort()]);
+        $config->setTopic('constructor-probe'); $config->setGroupId('constructor-probe'); $config->setAutoCommit(false);
+        $config->setConnectTimeout(0.2); $config->setSendTimeout(0.2); $config->setRecvTimeout(0.2);
+        $config->setGroupRetry(1); $config->setGroupRetrySleep(0.0);
+        try {
+            $error = refuses(fn () => new \longlang\phpkafka\Consumer\Consumer($config), 'Native constructor rejects unavailable coordinator',
+                \longlang\phpkafka\Exception\KafkaErrorException::class);
+            verify($error->getCode() === 15, 'Original native coordinator failure is preserved');
+            unset($error); gc_collect_cycles();
+            verify(count(ConstructorObservedClient::$weak) === 1, 'Constructor acquired one stored native client');
+            foreach (ConstructorObservedClient::$weak as $weak) {
+                $owned = $weak->get();
+                if ($owned !== null) {
+                    verify(!$owned->getSocket()->isConnected(), 'Failed constructor closes native TCP socket');
+                    stopped($owned, 'Failed constructor');
+                    clean($owned, 'Failed constructor');
+                } else {
+                    verify(true, 'Closed constructor-owned client is collectible');
+                }
+                unset($owned);
+            }
+        } finally {
+            // Makes the old-source rejecting control bounded without hiding failure.
+            foreach (ConstructorObservedClient::$weak as $weak) { $weak->get()?->close(); }
+        }
+    });
     verify(Coroutine::stats()['coroutine_num'] === $baseline, 'No native coroutine remains after lifecycle controls');
 });
 echo json_encode(['status' => 'PASS', 'checks' => $checks, 'php' => PHP_VERSION, 'swoole' => swoole_version(),

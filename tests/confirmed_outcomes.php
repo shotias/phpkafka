@@ -443,9 +443,19 @@ final class ClientSocketFixture extends \longlang\phpkafka\Socket\StreamSocket {
     public int $closed = 0;
     public bool $connected = true;
     public mixed $sendFailure = null;
-    public function connect(): void { $this->connected = true; }
+    public ?Throwable $connectFailure = null;
+    public ?Throwable $closeFailure = null;
+    public int $closeFailureAfter = 0;
+    public function connect(): void {
+        $this->connected = true;
+        if ($this->connectFailure !== null) { throw $this->connectFailure; }
+    }
     public function isConnected(): bool { return $this->connected; }
-    public function close(): bool { ++$this->closed; $this->connected = false; return true; }
+    public function close(): bool {
+        ++$this->closed; $this->connected = false;
+        if ($this->closeFailure !== null && $this->closed > $this->closeFailureAfter) { throw $this->closeFailure; }
+        return true;
+    }
     public function send(string $data, ?float $timeout = null): int {
         ++$this->sent;
         if ($this->sendFailure instanceof Throwable) { throw $this->sendFailure; }
@@ -506,15 +516,45 @@ check(pending($client) === [] && !$socket->connected, 'Parse failure closes and 
 [$client, $socket] = clientFixture(); $socket->reads = [new Error('handshake fixture')];
 rejection(fn () => $client->connect(), Error::class, 'ApiVersions handshake failure reaches caller');
 check(pending($client) === [] && !$socket->connected, 'Failed handshake leaves no connection/maps');
+// Nested client cleanup must preserve the exact original object, not merely its class.
+foreach (['connect', 'handshake', 'send', 'recv'] as $stage) {
+    [$client, $socket] = clientFixture();
+    $primary = new Error('client primary ' . $stage);
+    $socket->closeFailure = new LogicException('client cleanup');
+    if ($stage === 'connect' || $stage === 'handshake') {
+        $socket->closeFailureAfter = 1; // Initial explicit close succeeds.
+        if ($stage === 'connect') { $socket->connectFailure = $primary; }
+        else { $socket->reads = [$primary]; }
+        $call = fn () => $client->connect();
+    } elseif ($stage === 'send') {
+        $socket->sendFailure = $primary;
+        $call = fn () => $client->send(new P\ApiVersions\ApiVersionsRequest());
+    } else {
+        $id = $client->send(new P\ApiVersions\ApiVersionsRequest());
+        $socket->reads = [$primary];
+        $call = fn () => $client->recv($id);
+    }
+    check(rejection($call, Error::class, 'Nested client failure ' . $stage) === $primary, 'Original nested client error identity ' . $stage);
+    check(pending($client) === [] && !$socket->connected, 'Nested cleanup still clears unsafe client ' . $stage);
+}
+[$client, $socket] = clientFixture();
+$socket->closeFailure = new LogicException('explicit cleanup');
+check(rejection(fn () => $client->close(), LogicException::class, 'Explicit close failure remains visible') === $socket->closeFailure, 'Explicit close identity retained');
+check(rejection(fn () => $client->connect(), LogicException::class, 'Connect entry close failure remains visible') === $socket->closeFailure, 'Entry cleanup is not hidden');
 final class BootstrapFailureClient extends SyncClient {
     public static ?self $last = null;
     public static bool $failConnect = false;
+    public static bool $failClose = false;
     public int $closes = 0;
     public function __construct(string $host, int $port, ?\longlang\phpkafka\Config\CommonConfig $config = null, string $socketClass = ClientSocketFixture::class) {
         parent::__construct($host, $port, $config, ClientSocketFixture::class); self::$last = $this;
     }
     public function connect(): void { if (self::$failConnect) { throw new Error('bootstrap connect fixture'); } }
-    public function close(): bool { ++$this->closes; return parent::close(); }
+    public function close(): bool {
+        ++$this->closes; $result = parent::close();
+        if (self::$failClose) { throw new Error('bootstrap cleanup fixture'); }
+        return $result;
+    }
     public function sendRecv(AbstractRequest $request, ?P\RequestHeader\RequestHeader $requestHeader = null, ?P\ResponseHeader\ResponseHeader &$responseHeader = null): AbstractResponse { throw new Error('bootstrap metadata fixture'); }
 }
 $config = (new ProducerConfig())->setBootstrapServers(['tcp://unused:9092'])->setClient(BootstrapFailureClient::class);
@@ -526,6 +566,133 @@ foreach ([false, true] as $failure) {
 $broker = new Broker($config); $broker->setBrokers([1 => 'tcp://unused:9092']);
 rejection(fn () => $broker->getClientByBrokerId(1), Error::class, 'Cached client connect failure reaches caller');
 check(BootstrapFailureClient::$last->closes === 1, 'Unpublished cached client closes after connect failure');
+
+BootstrapFailureClient::$failClose = true;
+foreach ([false, true] as $failure) {
+    BootstrapFailureClient::$failConnect = $failure;
+    $original = rejection(fn () => (new Broker($config))->updateBrokers(), Error::class, 'Bootstrap primary failure survives cleanup');
+    check($original->getMessage() === ($failure ? 'bootstrap connect fixture' : 'bootstrap metadata fixture'), 'Bootstrap failure classification preserved');
+}
+$broker = new Broker($config); $broker->setBrokers([1 => 'tcp://unused:9092']);
+$original = rejection(fn () => $broker->getClientByBrokerId(1), Error::class, 'Unpublished cached-client primary failure survives cleanup');
+check($original->getMessage() === 'bootstrap connect fixture', 'Cached-client connection failure classification preserved');
+BootstrapFailureClient::$failClose = false;
+
+// Constructor failure owns resources which cannot be returned to a caller.
+final class ConstructorTimer extends NoopTimer {
+    public static array $active = [];
+    public static int $clears = 0;
+    public static bool $failClear = false;
+    public function tick(int $interval, callable $callback): int {
+        self::$active[71] = true;
+        return 71;
+    }
+    public function clear(int $timerId): void {
+        ++self::$clears; unset(self::$active[$timerId]);
+        if (self::$failClear) { throw new Error('timer cleanup fixture'); }
+    }
+}
+final class ConstructorClient extends SyncClient {
+    public static array $made = [];
+    public static string $stage = '';
+    public static ?Throwable $primary = null;
+    public static bool $failClose = false;
+    public int $closes = 0;
+    public bool $open = false;
+    public ?Throwable $closeError = null;
+    public function __construct(string $host, int $port, ?\longlang\phpkafka\Config\CommonConfig $config = null, string $socketClass = ClientSocketFixture::class) {
+        parent::__construct($host, $port, $config, ClientSocketFixture::class);
+        self::$made[] = $this;
+    }
+    public function connect(): void { $this->open = true; }
+    public function close(): bool {
+        ++$this->closes; $this->open = false; parent::close();
+        if (self::$failClose) { throw $this->closeError = new Error('client cleanup fixture'); }
+        return true;
+    }
+    public function sendRecv(AbstractRequest $request, ?P\RequestHeader\RequestHeader $requestHeader = null, ?P\ResponseHeader\ResponseHeader &$responseHeader = null): AbstractResponse {
+        if ($request instanceof P\Metadata\MetadataRequest) {
+            if (self::$stage === 'metadata') { throw self::$primary; }
+            return (new P\Metadata\MetadataResponse())->setBrokers([
+                (new P\Metadata\MetadataResponseBroker())->setNodeId(1)->setHost('unused')->setPort(9091),
+            ])->setTopics([(new P\Metadata\MetadataResponseTopic())->setName('probe')]);
+        }
+        if ($request instanceof P\FindCoordinator\FindCoordinatorRequest) {
+            if (self::$stage === 'coordinator') { throw self::$primary; }
+            return (new P\FindCoordinator\FindCoordinatorResponse())->setNodeId(1);
+        }
+        if ($request instanceof P\LeaveGroup\LeaveGroupRequest) { return new P\LeaveGroup\LeaveGroupResponse(); }
+        throw new LogicException('Unexpected constructor fixture request');
+    }
+}
+final class ConstructorFaultConsumer extends Consumer {
+    public function rejoin(): void {
+        // Explicit fixture checkpoint after acquiring two clients and a timer.
+        // The constructor and Broker lifecycle are actual native methods.
+        $this->broker->getClientByBrokerId(1);
+        $this->broker->getClientByBrokerId(2);
+        $this->memberId = 'constructor-member';
+        $this->startHeartbeat();
+        if (ConstructorClient::$stage === 'rejoin') { throw ConstructorClient::$primary; }
+    }
+}
+function constructorConfig(): ConsumerConfig {
+    $config = new ConsumerConfig();
+    $config->setClient(ConstructorClient::class);
+    $config->setSocket(ClientSocketFixture::class);
+    $config->setTimer(ConstructorTimer::class);
+    $config->setUpdateBrokers(false);
+    $config->setBroker([1 => 'tcp://unused:9091', 2 => 'tcp://unused:9092']);
+    $config->setTopic('probe'); $config->setGroupId('constructor-probe');
+    return $config;
+}
+foreach (['metadata', 'coordinator', 'rejoin'] as $stage) {
+    foreach ([false, true] as $cleanupFails) {
+        ConstructorClient::$made = []; ConstructorClient::$stage = $stage;
+        ConstructorClient::$primary = new Error('original constructor fixture');
+        ConstructorClient::$failClose = $cleanupFails;
+        ConstructorTimer::$active = []; ConstructorTimer::$clears = 0;
+        ConstructorTimer::$failClear = $cleanupFails;
+        $observed = rejection(fn () => new ConstructorFaultConsumer(constructorConfig()), Error::class, 'Constructor ' . $stage . ' rejects');
+        check($observed === ConstructorClient::$primary, 'Original constructor failure survives cleanup failures');
+        check(count(ConstructorClient::$made) >= 1, 'Constructor acquired native Broker client');
+        foreach (ConstructorClient::$made as $owned) {
+            check($owned->closes === 1 && !$owned->open, 'Every constructor-owned client is closed once');
+        }
+        check(ConstructorTimer::$active === [], 'Failed constructor leaves no acquired heartbeat timer');
+        if ($stage === 'rejoin') {
+            check(count(ConstructorClient::$made) === 2 && ConstructorTimer::$clears === 1, 'Two clients and created heartbeat were cleaned');
+        }
+    }
+}
+ConstructorClient::$made = []; ConstructorClient::$stage = ''; ConstructorClient::$failClose = false;
+ConstructorTimer::$active = []; ConstructorTimer::$clears = 0; ConstructorTimer::$failClear = false;
+$constructed = new ConstructorFaultConsumer(constructorConfig());
+check(count(ConstructorClient::$made) === 2 && ConstructorTimer::$active === [71 => true], 'Successful construction retains owned resources');
+foreach (ConstructorClient::$made as $owned) { check($owned->closes === 0 && $owned->open, 'Success path is not prematurely closed'); }
+$constructed->close();
+check(ConstructorTimer::$active === [], 'Successful consumer closes its heartbeat');
+foreach (ConstructorClient::$made as $owned) { check($owned->closes === 1 && !$owned->open, 'Successful close retains native lifecycle'); }
+
+$broker = new Broker(new ProducerConfig());
+$first = new ConstructorClient('unused', 9091); $second = new ConstructorClient('unused', 9092);
+property($broker, 'clients', [1 => $first, 2 => $second]);
+ConstructorClient::$failClose = true;
+$cleanupError = rejection(fn () => $broker->close(), Error::class, 'Broker cleanup failure stays visible');
+check($cleanupError === $first->closeError, 'Broker reports the first cleanup failure after attempting all clients');
+check($first->closes === 1 && $second->closes === 1, 'One cleanup failure cannot skip a sibling client');
+check((new ReflectionProperty(Broker::class, 'clients'))->getValue($broker) === [], 'Failed cleanup detaches all owned clients');
+$broker->close();
+check($first->closes === 1 && $second->closes === 1, 'Repeated Broker close does not repeat detached cleanup');
+ConstructorClient::$stage = 'metadata'; ConstructorClient::$primary = new Error('primary bootstrap fixture');
+$bootstrapConfig = new ProducerConfig();
+$bootstrapConfig->setBootstrapServers(['tcp://unused:9091']); $bootstrapConfig->setClient(ConstructorClient::class);
+$observed = rejection(fn () => (new Broker($bootstrapConfig))->updateBrokers(), Error::class, 'Bootstrap cleanup does not replace metadata failure');
+check($observed === ConstructorClient::$primary, 'Bootstrap primary exception identity is preserved');
+ConstructorClient::$stage = '';
+$observed = rejection(fn () => (new Broker($bootstrapConfig))->updateBrokers(), Error::class, 'Cleanup-only bootstrap failure rejects readiness');
+check($observed->getMessage() === 'client cleanup fixture', 'Cleanup-only failure remains visible');
+ConstructorClient::$failClose = false;
 
 echo json_encode(['status' => 'PASS', 'checks' => $checks, 'php' => PHP_VERSION,
     'scope' => 'Native methods with scripted responses, no real broker acceptance',

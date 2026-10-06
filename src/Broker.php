@@ -53,10 +53,19 @@ class Broker
 
     public function close(): void
     {
-        foreach ($this->clients as $client) {
-            $client->close();
-        }
+        $clients = $this->clients;
         $this->clients = [];
+        $failure = null;
+        foreach ($clients as $client) {
+            try {
+                $client->close();
+            } catch (\Throwable $exception) {
+                $failure = $failure ?? $exception;
+            }
+        }
+        if (null !== $failure) {
+            throw $failure;
+        }
     }
 
     public function updateBrokers(): void
@@ -85,11 +94,20 @@ class Broker
         $clientClass = KafkaUtil::getClientClass($config->getClient());
         /** @var ClientInterface $client */
         $client = new $clientClass($url['host'], $url['port'] ?? 9092, $config, KafkaUtil::getSocketClass($config->getSocket()));
+        $metadataCompleted = false;
         try {
             $client->connect();
             $response = $this->updateMetadata([], $client);
+            $metadataCompleted = true;
         } finally {
-            $client->close();
+            try {
+                $client->close();
+            } catch (\Throwable $cleanupFailure) {
+                if ($metadataCompleted) {
+                    throw $cleanupFailure;
+                }
+                // A connect/metadata failure is already unwinding; preserve it.
+            }
         }
 
         $brokers = [];
@@ -279,7 +297,11 @@ class Broker
         try {
             $client->connect();
         } catch (\Throwable $exception) {
-            $client->close();
+            try {
+                $client->close();
+            } catch (\Throwable $cleanupFailure) {
+                // The unpublished client's original connect failure takes precedence.
+            }
             throw $exception;
         }
         $this->clients[$brokerId] = $client;

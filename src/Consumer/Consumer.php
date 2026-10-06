@@ -141,21 +141,39 @@ class Consumer
         $this->timer = new $timerClass();
 
         $this->broker = $broker = new Broker($config);
-        if ($config->getUpdateBrokers()) {
-            $broker->updateBrokers();
-        } else {
-            $broker->setBrokers($config->getBroker());
+        try {
+            if ($config->getUpdateBrokers()) {
+                $broker->updateBrokers();
+            } else {
+                $broker->setBrokers($config->getBroker());
+            }
+
+            $this->groupManager = $groupManager = new GroupManager($broker);
+            $groupId = $config->getGroupId();
+
+            $this->broker->updateMetadata($config->getTopic());
+
+            // findCoordinator
+            $this->coordinator = $groupManager->findCoordinator($groupId, CoordinatorType::GROUP, $config->getGroupRetry(), $config->getGroupRetrySleep());
+
+            $this->rejoin();
+        } catch (\Throwable $exception) {
+            // Construction never returned an owner that could call close().
+            // Do not send LeaveGroup for a partially initialized member.
+            $this->closed = true;
+            $this->stop();
+            try {
+                $this->stopHeartbeat();
+            } catch (\Throwable $cleanupFailure) {
+                // Still close every acquired client and preserve the primary failure.
+            }
+            try {
+                $broker->close();
+            } catch (\Throwable $cleanupFailure) {
+                // Broker attempts all closes; cleanup cannot replace construction failure.
+            }
+            throw $exception;
         }
-
-        $this->groupManager = $groupManager = new GroupManager($broker);
-        $groupId = $config->getGroupId();
-
-        $this->broker->updateMetadata($config->getTopic());
-
-        // findCoordinator
-        $this->coordinator = $groupManager->findCoordinator($groupId, CoordinatorType::GROUP, $config->getGroupRetry(), $config->getGroupRetrySleep());
-
-        $this->rejoin();
     }
 
     public function rejoin(): void
