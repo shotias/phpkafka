@@ -90,3 +90,44 @@ PHP 8.4+ fork. Their checks are not represented as passing or replaced by
 equivalent coverage. The maintained workflow does not exercise Swoole, real
 Kafka, inherited PHPUnit, formatting or static analysis. Real-broker/runtime
 acceptance remains the consuming project's separate responsibility.
+
+## Client response and lifecycle repair
+
+Temporary bootstrap clients close in a finally block; failed cached-client
+connection setup also closes the unpublished client. Both native clients
+register only requests which expect a response, reject incomplete writes and
+pending correlation-ID reuse, clear registrations after every receive outcome,
+and close unsafe connections after transport or parsing failure. Synchronous
+split send/recv remains FIFO: a reply for a different pending ID rejects and
+closes the connection rather than being attributed to the wrong request.
+
+Response frames reuse the native 5 MiB read limit and require a complete
+correlation header. Response bodies always run the existing native unpacker,
+including empty bodies, and must consume exactly their frame. This avoids the
+factory's empty-data convenience path manufacturing a default response.
+
+The Swoole reader uses native Coroutine/Channel facilities. No-response sends
+allocate no receive channel. Unknown or duplicate replies fail visibly without
+an unbounded channel push. Closing invalidates registrations and the connection
+generation before waking waiters, closes the socket, and joins a different
+receiver coroutine for at most one second. A receiver does not join itself.
+Reconnect refuses a still-live receiver, including reconnect attempted from its
+exception callback, because the inherited socket wrapper reuses mutable native
+connection state. Suspended old send/recv cleanup cannot clear a new generation's
+registration or close its socket. Exception callbacks run after connection
+cleanup; they must return promptly, and callback exceptions are not swallowed.
+The native join API is verified against Swoole 6.2.2; older Swoole compatibility
+is not claimed. Request timeout configuration remains the caller's obligation.
+
+Additional runtime check (requires real Swoole; absence exits nonzero):
+    php tests/client_lifecycle.php
+
+This check uses actual Swoole coroutines, channels, joins and loopback TCP sockets
+with scripted wire replies, plus explicitly identified socket fault injection
+for partial writes and scheduling races. It covers idle-reader cleanup,
+no-response sends, missing/duplicate/malformed replies, parsing errors, native
+socket reconnect, old-generation cleanup, concurrent waiters, and bounded refusal
+to replace a socket while its old receiver remains alive. It is not a real
+Kafka or production TLS acceptance test. The PHP-only CI continues to run the
+two standalone non-Swoole checks and syntax-lints this runtime check; it does not
+claim to execute it.

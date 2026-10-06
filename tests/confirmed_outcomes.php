@@ -436,10 +436,101 @@ rejection(fn () => $consumer->rejoin(), LogicException::class, 'Close during rej
 check(count($client->requests) === 2, 'Close during rejoin performs no subsequent sync/offset/heartbeat requests');
 rejection(fn () => $consumer->consume(), LogicException::class, 'Closed suspended rejoin cannot reopen consumer');
 
+
+final class ClientSocketFixture extends \longlang\phpkafka\Socket\StreamSocket {
+    public array $reads = [];
+    public int $sent = 0;
+    public int $closed = 0;
+    public bool $connected = true;
+    public mixed $sendFailure = null;
+    public function connect(): void { $this->connected = true; }
+    public function isConnected(): bool { return $this->connected; }
+    public function close(): bool { ++$this->closed; $this->connected = false; return true; }
+    public function send(string $data, ?float $timeout = null): int {
+        ++$this->sent;
+        if ($this->sendFailure instanceof Throwable) { throw $this->sendFailure; }
+        return $this->sendFailure ?? strlen($data);
+    }
+    public function recv(int $length, ?float $timeout = null): string {
+        if (!$this->reads) { throw new LogicException('Client read fixture exhausted'); }
+        $value = array_shift($this->reads);
+        if ($value instanceof Throwable) { throw $value; }
+        return $value;
+    }
+}
+final class PackFailureRequest extends P\ApiVersions\ApiVersionsRequest {
+    public function pack(int $apiVersion = 0): string { throw new Error('pack fixture'); }
+}
+function clientFixture(): array {
+    $client = new SyncClient('unused', 9092, null, ClientSocketFixture::class);
+    return [$client, $client->getSocket()];
+}
+function pending(object $client): array {
+    return (new ReflectionProperty(SyncClient::class, 'waitResponseMaps'))->getValue($client);
+}
+function apiFrame(int $correlation): array {
+    $body = Int32::pack($correlation) . (new P\ApiVersions\ApiVersionsResponse())->pack(1);
+    return [Int32::pack(strlen($body)), $body];
+}
+[$client, $socket] = clientFixture();
+for ($i = 0; $i < 100; ++$i) { $client->send(new P\ApiVersions\ApiVersionsRequest(), null, false); }
+check(pending($client) === [] && $socket->sent === 100, 'Sync no-response sends retain no maps');
+rejection(fn () => $client->send(new PackFailureRequest()), Error::class, 'Pack failure reaches caller');
+check(pending($client) === [] && $socket->sent === 100, 'Pack failure registers and sends nothing');
+foreach ([new Error('send fixture'), 0, 1] as $failure) {
+    [$client, $socket] = clientFixture(); $socket->sendFailure = $failure;
+    rejection(fn () => $client->send(new P\ApiVersions\ApiVersionsRequest()), $failure instanceof Error ? Error::class : \longlang\phpkafka\Exception\SocketException::class, 'Failed/short send rejects');
+    check(pending($client) === [] && !$socket->connected, 'Failed/short send closes connection and removes maps');
+}
+[$client, $socket] = clientFixture();
+$first = $client->send(new P\ApiVersions\ApiVersionsRequest());
+$second = $client->send(new P\ApiVersions\ApiVersionsRequest());
+$socket->reads = array_merge(apiFrame($first), apiFrame($second));
+check($client->recv($first) instanceof P\ApiVersions\ApiVersionsResponse, 'Sync split FIFO first response');
+check($client->recv($second) instanceof P\ApiVersions\ApiVersionsResponse && pending($client) === [], 'Sync split FIFO second response and cleanup');
+[$client, $socket] = clientFixture();
+$first = $client->send(new P\ApiVersions\ApiVersionsRequest()); $second = $client->send(new P\ApiVersions\ApiVersionsRequest());
+$socket->reads = apiFrame($second);
+rejection(fn () => $client->recv($first), \longlang\phpkafka\Exception\SocketException::class, 'Sync rejects out-of-order correlation');
+check(pending($client) === [] && !$socket->connected, 'Mismatched response cannot contaminate later request');
+foreach ([new Error('read fixture'), '', Int32::pack(-1), Int32::pack(0), Int32::pack(3), Int32::pack(5242881)] as $frame) {
+    [$client, $socket] = clientFixture(); $id = $client->send(new P\ApiVersions\ApiVersionsRequest());
+    $socket->reads = [$frame];
+    rejection(fn () => $client->recv($id), $frame instanceof Error ? Error::class : \longlang\phpkafka\Exception\SocketException::class, 'Read error or invalid frame length rejects');
+    check(pending($client) === [] && !$socket->connected && $socket->reads === [], 'Invalid header never reads body and clears maps');
+}
+[$client, $socket] = clientFixture(); $id = $client->send(new P\ApiVersions\ApiVersionsRequest());
+$socket->reads = [Int32::pack(4), Int32::pack($id)];
+rejection(fn () => $client->recv($id), Throwable::class, 'Native malformed response body rejects');
+check(pending($client) === [] && !$socket->connected, 'Parse failure closes and clears maps');
+[$client, $socket] = clientFixture(); $socket->reads = [new Error('handshake fixture')];
+rejection(fn () => $client->connect(), Error::class, 'ApiVersions handshake failure reaches caller');
+check(pending($client) === [] && !$socket->connected, 'Failed handshake leaves no connection/maps');
+final class BootstrapFailureClient extends SyncClient {
+    public static ?self $last = null;
+    public static bool $failConnect = false;
+    public int $closes = 0;
+    public function __construct(string $host, int $port, ?\longlang\phpkafka\Config\CommonConfig $config = null, string $socketClass = ClientSocketFixture::class) {
+        parent::__construct($host, $port, $config, ClientSocketFixture::class); self::$last = $this;
+    }
+    public function connect(): void { if (self::$failConnect) { throw new Error('bootstrap connect fixture'); } }
+    public function close(): bool { ++$this->closes; return parent::close(); }
+    public function sendRecv(AbstractRequest $request, ?P\RequestHeader\RequestHeader $requestHeader = null, ?P\ResponseHeader\ResponseHeader &$responseHeader = null): AbstractResponse { throw new Error('bootstrap metadata fixture'); }
+}
+$config = (new ProducerConfig())->setBootstrapServers(['tcp://unused:9092'])->setClient(BootstrapFailureClient::class);
+foreach ([false, true] as $failure) {
+    BootstrapFailureClient::$failConnect = $failure;
+    rejection(fn () => (new Broker($config))->updateBrokers(), Error::class, 'Bootstrap metadata/connect failure reaches caller');
+    check(BootstrapFailureClient::$last->closes === 1, 'Temporary bootstrap client always closes');
+}
+$broker = new Broker($config); $broker->setBrokers([1 => 'tcp://unused:9092']);
+rejection(fn () => $broker->getClientByBrokerId(1), Error::class, 'Cached client connect failure reaches caller');
+check(BootstrapFailureClient::$last->closes === 1, 'Unpublished cached client closes after connect failure');
+
 echo json_encode(['status' => 'PASS', 'checks' => $checks, 'php' => PHP_VERSION,
     'scope' => 'Native methods with scripted responses, no real broker acceptance',
     'sources' => array_map(static fn (string $file): string => hash_file('sha256', dirname(__DIR__) . '/' . $file), [
-        'src/Producer/Producer.php', 'src/Consumer/Consumer.php', 'src/Consumer/ConsumeMessage.php',
+        'src/Client/SyncClient.php', 'src/Client/SwooleClient.php', 'src/Producer/Producer.php', 'src/Consumer/Consumer.php', 'src/Consumer/ConsumeMessage.php',
         'src/Consumer/OffsetManager.php', 'src/Broker.php', 'src/Protocol/RecordBatch/RecordBatch.php', 'src/Protocol/RecordBatch/Record.php',
     ]),
 ], JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR), PHP_EOL;
