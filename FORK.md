@@ -75,3 +75,18 @@ real broker behavior, TLS, production replication, application outbox/inbox
 atomicity or graceful Hyperf drain. Consuming applications must run rebuilt
 real-broker crash/offset controls before adoption. No inherited development
 dependency was upgraded or newly installed for these standalone checks.
+
+## Maintained-fork CI
+
+The active native CI uses the same reviewed PHP 8.4.25 public image digest as
+the consuming project and a pinned checkout action on Ubuntu 24.04. Test
+execution has no network and mounts the candidate source read-only. It lints
+the native/test PHP files and runs both standalone checks above with strict
+exit propagation. It installs no Composer dependencies.
+
+The inherited PHP 7.1–8.1/Kafka matrix, coding-standard and PHPStan workflows
+were retired because their runtime/toolchain assumptions do not match this
+PHP 8.4+ fork. Their checks are not represented as passing or replaced by
+equivalent coverage. The maintained workflow does not exercise Swoole, real
+Kafka, inherited PHPUnit, formatting or static analysis. Real-broker/runtime
+acceptance remains the consuming project's separate responsibility.

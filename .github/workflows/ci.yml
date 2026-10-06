@@ -1,69 +1,54 @@
-name: ci
+name: Native PHP checks
 
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-php-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  ci:
-    runs-on: ubuntu-20.04
-
-    strategy:
-      fail-fast: false
-      matrix:
-        swoole: [
-          4.5-php7.1,
-          4.5-php7.2,
-          4.5-php7.3,
-          4.5-php7.4,
-          4.5-php8.0,
-          php8.1,
-        ]
-        kafka: [1.0.0, 2.11-1.1.1, 2.13-2.6.0, 2.13-2.7.0]
-
+  native:
+    name: Native PHP 8.4 checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     env:
-      SWOOLE_VERSION: ${{ matrix.swoole }}
-      KAFKA_VERSION: ${{ matrix.kafka }}
-      KAFKA_HOST: kafka1
-      KAFKA_PLAINTEXT_PORT: 9092
-      KAFKA_SASL_PLAINTEXT_PORT: 9093
-      KAFKA_SASL_SSL_PORT: 9094
-      KAFKA_SSL_PORT: 9095
-      KAFKA_SASL: '{"type":"longlang\\phpkafka\\Sasl\\PlainSasl","username":"admin","password":"admin-secret"}'
-      KAFKA_SSL: '{"open":true,"verifyPeer":true,"allowSelfSigned":true,"verifyPeerName":true,"cafile":"/kafka-client/.github/kafka/cert/ca-cert"}'
-
+      NATIVE_PHP_IMAGE: php:8.4.25-cli-bookworm@sha256:d0379b413e257a77de0882e4c43ed0eca154d1c88be566f240f9fe359671f2bf
     steps:
-      - uses: actions/checkout@v2
+      - name: Check out candidate revision
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          persist-credentials: false
 
-      - name: start docker
+      - name: Pull pinned native PHP interpreter
+        shell: bash
         run: |
-          cd .github
-          # run
-          docker-compose up -d
-          # swoole
-          docker exec swoole php -v && docker exec swoole php --ri swoole && docker exec swoole composer -V
-          docker ps -a && docker ps
+          set -euo pipefail
+          docker pull "$NATIVE_PHP_IMAGE"
+          docker image inspect --format '{{.Id}}' "$NATIVE_PHP_IMAGE"
+          git rev-parse HEAD
 
-      - name: prepare
+      - name: Lint PHP and run standalone native regressions
+        shell: bash
         run: |
-          docker exec swoole composer update
-          docker exec kafka1 /opt/kafka/bin/kafka-topics.sh --zookeeper zookeeper:2181 --create --partitions 3 --replication-factor 1 --topic test
-          docker exec kafka1 /opt/kafka/bin/kafka-topics.sh --zookeeper zookeeper:2181 --create --partitions 3 --replication-factor 1 --topic test-header
+          set -euo pipefail
+          docker run --rm --network=none --read-only \
+            --user "$(id -u):$(id -g)" \
+            --mount "type=bind,source=${GITHUB_WORKSPACE},target=/source,readonly" \
+            --workdir /source --entrypoint bash "$NATIVE_PHP_IMAGE" -euo pipefail -c '
+              php -r '\''if (PHP_VERSION !== "8.4.25") { exit(1); } echo PHP_VERSION, PHP_EOL;'\''
+              find src tests -type f -name "*.php" -print0 | xargs -0 -r -n 1 php -l
+              php tests/native_crc32c.php
+              php tests/confirmed_outcomes.php
+            '
 
-      - name: plaintext-test
+      - name: Record check scope
+        if: always()
+        shell: bash
         run: |
-          docker exec -e KAFKA_HOST="$KAFKA_HOST" -e KAFKA_PORT="$KAFKA_PLAINTEXT_PORT" -e KAFKA_VERSION="$KAFKA_VERSION" swoole composer test
-          docker exec -e KAFKA_HOST="$KAFKA_HOST" -e KAFKA_PORT="$KAFKA_PLAINTEXT_PORT" -e KAFKA_VERSION="$KAFKA_VERSION"  swoole composer swoole-test
-
-      - name: sasl-plaintext-test
-        run: |
-          docker exec -e KAFKA_HOST="$KAFKA_HOST" -e KAFKA_PORT="$KAFKA_SASL_PLAINTEXT_PORT" -e KAFKA_VERSION="$KAFKA_VERSION" -e KAFKA_SASL="$KAFKA_SASL" swoole composer test
-          docker exec -e KAFKA_HOST="$KAFKA_HOST" -e KAFKA_PORT="$KAFKA_SASL_PLAINTEXT_PORT" -e KAFKA_VERSION="$KAFKA_VERSION"  -e KAFKA_SASL="$KAFKA_SASL" swoole composer swoole-test
-
-      - name: sasl-ssl-test
-        run: |
-          docker exec -e KAFKA_HOST="$KAFKA_HOST" -e KAFKA_PORT="$KAFKA_SASL_SSL_PORT" -e KAFKA_VERSION="$KAFKA_VERSION" -e KAFKA_SASL="$KAFKA_SASL" -e KAFKA_SSL="$KAFKA_SSL" swoole composer test
-          docker exec -e KAFKA_HOST="$KAFKA_HOST" -e KAFKA_PORT="$KAFKA_SASL_SSL_PORT" -e KAFKA_VERSION="$KAFKA_VERSION" -e KAFKA_SASL="$KAFKA_SASL" -e KAFKA_SSL="$KAFKA_SSL" swoole composer swoole-test
-
-      - name: ssl-test
-        run: |
-          docker exec -e KAFKA_HOST="$KAFKA_HOST" -e KAFKA_PORT="$KAFKA_SSL_PORT" -e KAFKA_VERSION="$KAFKA_VERSION" -e KAFKA_SSL="$KAFKA_SSL" swoole composer test
-          docker exec -e KAFKA_HOST="$KAFKA_HOST" -e KAFKA_PORT="$KAFKA_SSL_PORT" -e KAFKA_VERSION="$KAFKA_VERSION" -e KAFKA_SSL="$KAFKA_SSL" swoole composer swoole-test
+          printf '%s\n' \
+            'This job runs PHP syntax checks and standalone native CRC32C/confirmed-outcome regressions.' \
+            'It does not install Composer dependencies or run inherited PHPUnit, formatter, PHPStan, Swoole, or real-broker integration suites.' \
+            'Consult preceding steps for the actual pass/fail result.' >> "$GITHUB_STEP_SUMMARY"
