@@ -131,3 +131,14 @@ to replace a socket while its old receiver remains alive. It is not a real
 Kafka or production TLS acceptance test. The PHP-only CI continues to run the
 two standalone non-Swoole checks and syntax-lints this runtime check; it does not
 claim to execute it.
+
+The underlying SwooleSocket also captures the native socket for each send/recv.
+After native IO yields, it checks ownership before reading errors, appending to
+the current buffer or closing the current connection. A superseded native
+socket is closed separately and its operation fails. Close detaches the socket
+and clears its buffer before native close can resume another coroutine. Actual
+native backpressure and delayed-read controls replace the wrapper connection
+while an old operation is suspended and verify the replacement socket and its
+buffer survive. This adds no writer pool or connection engine. SyncClient's
+StreamSocket remains a synchronous adapter; no Swoole hook behavior is claimed
+for that adapter.

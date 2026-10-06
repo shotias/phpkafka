@@ -94,22 +94,30 @@ class SwooleSocket implements SocketInterface
 
     public function close(): bool
     {
-        if ($this->socket) {
-            $this->socket->close();
-            $this->receivedBuffer = '';
+        $socket = $this->socket;
+        // Native close can resume blocked senders/readers, including their callers.
+        // Detach before that yield so an old close never clears a new buffer.
+        $this->socket = null;
+        $this->receivedBuffer = '';
 
-            return true;
-        } else {
-            return false;
-        }
+        return $socket ? $socket->close() : false;
     }
 
     public function send(string $data, ?float $timeout = null): int
     {
-        $result = $this->socket->send($data);
+        $socket = $this->socket;
+        if (!$socket) {
+            throw new SocketException('Socket is not connected');
+        }
+        $result = $socket->send($data);
+        if ($socket !== $this->socket) {
+            $socket->close();
+            throw new SocketException('Socket changed during send');
+        }
         if (false === $result) {
+            $message = sprintf('Could not write data to stream, %s [%d]', $socket->errMsg, $socket->errCode);
             $this->close();
-            throw new SocketException(sprintf('Could not write data to stream, %s [%d]', $this->socket->errMsg, $this->socket->errCode));
+            throw new SocketException($message);
         }
 
         return $result;
@@ -117,18 +125,25 @@ class SwooleSocket implements SocketInterface
 
     public function recv(int $length, ?float $timeout = null): string
     {
+        $socket = $this->socket;
+        if (!$socket) {
+            throw new SocketException('Socket is not connected');
+        }
         $beginTime = microtime(true);
         if (null === $timeout) {
             $timeout = $this->config->getRecvTimeout();
         }
         $leftTime = $timeout;
-        while ($this->socket && !isset($this->receivedBuffer[$length - 1]) && (-1 == $timeout || $leftTime > 0)) {
-            $buffer = $this->socket->recv($timeout);
+        while (!isset($this->receivedBuffer[$length - 1]) && (-1 == $timeout || $leftTime > 0)) {
+            $buffer = $socket->recv($timeout);
+            if ($socket !== $this->socket) {
+                $socket->close();
+                throw new SocketException('Socket changed during receive');
+            }
             if ('' === $buffer || false === $buffer) {
-                $code = $this->socket->errCode;
-                $msg = $this->socket->errMsg;
+                $message = sprintf('Could not recv data from stream, %s [%d]', $socket->errMsg, $socket->errCode);
                 $this->close();
-                throw new SocketException(sprintf('Could not recv data from stream, %s [%d]', $msg, $code));
+                throw new SocketException($message);
             }
             $this->receivedBuffer .= $buffer;
             if ($timeout > 0) {
@@ -143,7 +158,7 @@ class SwooleSocket implements SocketInterface
             return $result;
         }
 
-        if ($this->socket->isConnected()) {
+        if ($socket->isConnected()) {
             $this->close();
             throw new SocketException('Could not recv data from stream');
         }

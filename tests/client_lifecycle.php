@@ -297,10 +297,79 @@ Coroutine\run(static function (): void {
     verify($done->pop(1) === true, 'Stalled receiver waiting request fails');
     if (Coroutine::exists($waiter)) { Coroutine::join([$waiter], 1); }
     stopped($client, 'Released stalled receiver');
+
+    foreach (['send', 'recv'] as $operation) {
+        // Exercise the actual mutable wrapper and native IO, not FaultSocket.
+        // Direct wrapper reconnect while IO is suspended tests its ownership guard.
+        $listener = new Socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+        verify($listener->bind('127.0.0.1', 0) && $listener->listen(), 'Native ownership listener opens');
+        $port = $listener->getsockname()['port'];
+        $ready = new Channel(1); $late = new Channel(1); $finish = new Channel(1); $serverDone = new Channel(1);
+        $server = Coroutine::create(static function () use ($listener, $ready, $late, $finish, $serverDone, $operation): void {
+            $first = $second = null;
+            try {
+                $first = $listener->accept(1);
+                if (!$first instanceof Socket) { throw new RuntimeException('Old socket accept failed'); }
+                if (!$first->setOption(SOL_SOCKET, SO_RCVBUF, 4096)) { throw new RuntimeException('Backpressure receive buffer setup failed'); }
+                $ready->push(true);
+                $second = $listener->accept(1);
+                if (!$second instanceof Socket || $second->sendAll('AB', 1) !== 2) { throw new RuntimeException('New socket setup failed'); }
+                if ($operation === 'recv') {
+                    if ($late->pop(1) !== true || $first->sendAll('X', 1) !== 1) { throw new RuntimeException('Old receive response control failed'); }
+                }
+                $finish->pop(1);
+                $serverDone->push(true);
+            } catch (Throwable $exception) { $serverDone->push($exception); }
+            finally {
+                if ($first instanceof Socket) { $first->close(); }
+                if ($second instanceof Socket) { $second->close(); }
+                $listener->close();
+            }
+        });
+        $config = (new CommonConfig())->setConnectTimeout(0.3)->setSendTimeout(0.2)->setRecvTimeout(0.4);
+        $wrapper = new SwooleSocket('127.0.0.1', $port, $config);
+        $old = null; $sender = null; $done = new Channel(1);
+        try {
+            $wrapper->connect();
+            verify($ready->pop(1) === true, 'Old native connection accepted');
+            $old = field($wrapper, 'socket');
+            if ($operation === 'send') {
+                $size = 16 * 1024 * 1024;
+                $written = $wrapper->send(str_repeat('x', $size));
+                verify($written > 0 && $written < $size, 'Native partial write fills the blocked connection before stale-send control');
+            }
+            $sender = Coroutine::create(static function () use ($wrapper, $done, $operation): void {
+                try {
+                    if ($operation === 'send') { $wrapper->send(str_repeat('x', 16 * 1024 * 1024)); }
+                    else { $wrapper->recv(1); }
+                    $done->push(false);
+                } catch (SocketException $exception) { $done->push($exception); }
+            });
+            Coroutine::sleep(0.005);
+            verify(Coroutine::exists($sender) && $done->isEmpty(), 'Actual native ' . $operation . ' is suspended by peer');
+            $wrapper->connect();
+            verify(field($wrapper, 'socket') !== $old && $wrapper->recv(1) === 'A', 'Replacement native connection receives its first byte');
+            verify(field($wrapper, 'receivedBuffer') === 'B', 'Replacement buffer holds only its own second byte');
+            if ($operation === 'recv') { $late->push(true); }
+            $result = $done->pop(0.8);
+            if (Coroutine::exists($sender)) { Coroutine::join([$sender], 1); }
+            verify($wrapper->isConnected() && $wrapper->recv(1) === 'B', 'Old native ' . $operation . ' leaves replacement socket and buffer intact');
+            verify($result instanceof SocketException && str_contains($result->getMessage(), 'Socket changed'), 'Old native ' . $operation . ' detects replaced socket');
+            verify(!$old->isConnected(), 'Superseded native socket is closed');
+        } finally {
+            if ($old !== null) { $old->close(); }
+            $wrapper->close(); $finish->push(true);
+            if ($sender !== null && Coroutine::exists($sender)) { Coroutine::join([$sender], 1); }
+            if (Coroutine::exists($server)) { Coroutine::join([$server], 1); }
+        }
+        $result = $serverDone->pop(0.1);
+        if ($result instanceof Throwable) { throw $result; }
+        verify($result === true && !Coroutine::exists($server), 'Native ownership peer is joined');
+    }
     verify(Coroutine::stats()['coroutine_num'] === $baseline, 'No native coroutine remains after lifecycle controls');
 });
 echo json_encode(['status' => 'PASS', 'checks' => $checks, 'php' => PHP_VERSION, 'swoole' => swoole_version(),
     'scope' => 'Actual Swoole coroutine/channel/socket lifecycle with scripted loopback peer and explicit socket faults; no real Kafka acceptance',
     'sources' => array_map(static fn (string $file): string => hash_file('sha256', dirname(__DIR__) . '/' . $file),
-        ['src/Client/SwooleClient.php', 'src/Client/SyncClient.php', 'src/Broker.php'])],
+        ['src/Client/SwooleClient.php', 'src/Client/SyncClient.php', 'src/Socket/SwooleSocket.php', 'src/Broker.php'])],
     JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR), PHP_EOL;
