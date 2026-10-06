@@ -681,9 +681,14 @@ ConstructorClient::$failClose = true;
 $cleanupError = rejection(fn () => $broker->close(), Error::class, 'Broker cleanup failure stays visible');
 check($cleanupError === $first->closeError, 'Broker reports the first cleanup failure after attempting all clients');
 check($first->closes === 1 && $second->closes === 1, 'One cleanup failure cannot skip a sibling client');
-check((new ReflectionProperty(Broker::class, 'clients'))->getValue($broker) === [], 'Failed cleanup detaches all owned clients');
+check((new ReflectionProperty(Broker::class, 'clients'))->getValue($broker) === [], 'Failed clients cannot be reused as active connections');
+check(count((new ReflectionProperty(Broker::class, 'pendingCloseClients'))->getValue($broker)) === 2, 'Failed cleanup retains both resources for explicit retry');
+ConstructorClient::$failClose = false;
 $broker->close();
-check($first->closes === 1 && $second->closes === 1, 'Repeated Broker close does not repeat detached cleanup');
+check($first->closes === 2 && $second->closes === 2, 'Repeated Broker close retries failed resources');
+$broker->close();
+check($first->closes === 2 && $second->closes === 2, 'Successful cleanup is not repeated');
+ConstructorClient::$failClose = true;
 ConstructorClient::$stage = 'metadata'; ConstructorClient::$primary = new Error('primary bootstrap fixture');
 $bootstrapConfig = new ProducerConfig();
 $bootstrapConfig->setBootstrapServers(['tcp://unused:9091']); $bootstrapConfig->setClient(ConstructorClient::class);
@@ -693,6 +698,61 @@ ConstructorClient::$stage = '';
 $observed = rejection(fn () => (new Broker($bootstrapConfig))->updateBrokers(), Error::class, 'Cleanup-only bootstrap failure rejects readiness');
 check($observed->getMessage() === 'client cleanup fixture', 'Cleanup-only failure remains visible');
 ConstructorClient::$failClose = false;
+
+// A failure before disconnect must remain owned; successful siblings are never retried.
+final class RetryCleanupClient extends SyncClient {
+    public int $closes = 0;
+    public int $failures = 0;
+    public ?Closure $duringClose = null;
+    public Throwable $cleanupFailure;
+    public function __construct(string $host = 'unused', int $port = 1, ?\longlang\phpkafka\Config\CommonConfig $config = null, string $socketClass = ClientSocketFixture::class) {
+        parent::__construct($host, $port, $config, $socketClass);
+        $this->cleanupFailure = new RuntimeException('retained cleanup failure');
+    }
+    public function close(): bool {
+        ++$this->closes;
+        if ($this->duringClose !== null) { ($this->duringClose)(); }
+        if ($this->failures > 0) { --$this->failures; throw $this->cleanupFailure; }
+        return parent::close();
+    }
+}
+$broker = new Broker(new ProducerConfig());
+$first = new RetryCleanupClient(); $second = new RetryCleanupClient(); $third = new RetryCleanupClient();
+$first->failures = $second->failures = 1;
+property($broker, 'clients', [0 => $first, 1 => $second, 2 => $third]);
+check(rejection(fn () => $broker->close(), RuntimeException::class, 'First close attempts every resource') === $first->cleanupFailure, 'First cleanup failure identity retained');
+check($first->closes === 1 && $second->closes === 1 && $third->closes === 1, 'All three initial clients attempted');
+check($first->getSocket()->isConnected() && $second->getSocket()->isConnected() && !$third->getSocket()->isConnected(), 'Injected failed resources are still connected before retry');
+$broker->close();
+check(!$first->getSocket()->isConnected() && !$second->getSocket()->isConnected(), 'Explicit retry disconnects both retained resources');
+check($first->closes === 2 && $second->closes === 2 && $third->closes === 1, 'Only failed resources retried');
+$broker->close();
+check($first->closes === 2 && $second->closes === 2 && $third->closes === 1, 'Third close is idempotent');
+
+$broker = new Broker(new ProducerConfig());
+$old = new RetryCleanupClient(); $replacement = new RetryCleanupClient();
+$old->failures = 1;
+$old->duringClose = static function () use ($broker, $old, $replacement): void {
+    $old->duringClose = null;
+    property($broker, 'clients', [0 => $replacement]);
+};
+property($broker, 'clients', [0 => $old]);
+check(rejection(fn () => $broker->close(), RuntimeException::class, 'Replacement during failed close') === $old->cleanupFailure, 'Old cleanup failure preserved');
+check((new ReflectionProperty(Broker::class, 'clients'))->getValue($broker) === [0 => $replacement], 'Old failure never overwrites new active connection');
+check($replacement->closes === 0 && $replacement->getSocket()->isConnected(), 'Snapshot cleanup does not touch replacement');
+$broker->close();
+check($old->closes === 2 && $replacement->closes === 1, 'Next explicit close attempts retained old and active replacement');
+check(!$old->getSocket()->isConnected() && !$replacement->getSocket()->isConnected(), 'Both generations release their owned resources');
+
+$broker = new Broker(new ProducerConfig()); $client = new RetryCleanupClient();
+$client->duringClose = static function () use ($broker): void {
+    rejection(fn () => $broker->close(), LogicException::class, 'Reentrant close is bounded and explicit');
+};
+property($broker, 'clients', [0 => $client]);
+$broker->close();
+check($client->closes === 1 && !$client->getSocket()->isConnected(), 'Reentrant close never repeats in-flight native cleanup');
+$broker->close();
+check($client->closes === 1, 'Close guard resets after successful cleanup');
 
 echo json_encode(['status' => 'PASS', 'checks' => $checks, 'php' => PHP_VERSION,
     'scope' => 'Native methods with scripted responses, no real broker acceptance',

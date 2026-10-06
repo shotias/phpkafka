@@ -34,6 +34,16 @@ class Broker
     protected $clients = [];
 
     /**
+     * Clients whose cleanup has not completed, keyed by object identity.
+     *
+     * @var ClientInterface[]
+     */
+    private $pendingCloseClients = [];
+
+    /** @var bool */
+    private $closing = false;
+
+    /**
      * @var MetadataResponseTopic[]
      */
     protected $topicsMeta;
@@ -53,18 +63,32 @@ class Broker
 
     public function close(): void
     {
-        $clients = $this->clients;
-        $this->clients = [];
-        $failure = null;
-        foreach ($clients as $client) {
-            try {
-                $client->close();
-            } catch (\Throwable $exception) {
-                $failure = $failure ?? $exception;
-            }
+        if ($this->closing) {
+            throw new \LogicException('Broker close already in progress');
         }
-        if (null !== $failure) {
-            throw $failure;
+        $this->closing = true;
+        try {
+            foreach ($this->clients as $client) {
+                $this->pendingCloseClients[spl_object_id($client)] = $client;
+            }
+            $this->clients = [];
+            $clients = $this->pendingCloseClients;
+            $failure = null;
+            foreach ($clients as $id => $client) {
+                try {
+                    $client->close();
+                    unset($this->pendingCloseClients[$id]);
+                } catch (\Throwable $exception) {
+                    // Retain ownership for an explicit retry. New active connections
+                    // created while close yields remain in their separate broker map.
+                    $failure = $failure ?? $exception;
+                }
+            }
+            if (null !== $failure) {
+                throw $failure;
+            }
+        } finally {
+            $this->closing = false;
         }
     }
 

@@ -151,8 +151,12 @@ It stops consumption, clears any acquired heartbeat timer and closes all stored
 Broker clients without sending LeaveGroup for a partially initialized member.
 The original failure object is rethrown even when cleanup also fails.
 
-Broker close detaches its client collection, attempts every client close and then
-reports the first cleanup failure. Temporary bootstrap and unpublished connection
+Broker close detaches its active client collection, attempts every client close
+and then reports the first cleanup failure. Failed closes remain owned in a
+separate pending-cleanup collection for later explicit retry; successful closes
+are removed. A newer active connection created while cleanup yields is not
+overwritten by an older failed close. Reentrant/concurrent close attempts reject
+while the current close owns its snapshot. Temporary bootstrap and unpublished connection
 cleanup likewise preserve an already-active connection/metadata failure; a
 cleanup-only failure remains visible. Both native clients preserve primary
 transport/protocol errors across failing cleanup. The Swoole receiver still
