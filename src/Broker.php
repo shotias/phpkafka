@@ -85,9 +85,12 @@ class Broker
         $clientClass = KafkaUtil::getClientClass($config->getClient());
         /** @var ClientInterface $client */
         $client = new $clientClass($url['host'], $url['port'] ?? 9092, $config, KafkaUtil::getSocketClass($config->getSocket()));
-        $client->connect();
-        $response = $this->updateMetadata([], $client);
-        $client->close();
+        try {
+            $client->connect();
+            $response = $this->updateMetadata([], $client);
+        } finally {
+            $client->close();
+        }
 
         $brokers = [];
         foreach ($response->getBrokers() as $broker) {
@@ -107,48 +110,59 @@ class Broker
             $client = $this->getClient();
         }
         $config = $this->config;
-        $request = new MetadataRequest();
-        $topicsArray = [];
-        foreach ($topics as $topic) {
-            $topicsArray[] = (new MetadataRequestTopic())->setName($topic);
+        $retry = $config instanceof ProducerConfig ? $config->getProduceRetry() : $config->getGroupRetry();
+        $sleep = $config instanceof ProducerConfig ? $config->getProduceRetrySleep() : $config->getGroupRetrySleep();
+        if ($retry < 0) {
+            throw new InvalidArgumentException('Metadata retry budget must not be negative');
         }
-        $request->setTopics($topicsArray ?: null);
-        $request->setAllowAutoTopicCreation($config->getAutoCreateTopic());
-        /** @var MetadataResponse $response */
-        $response = $client->sendRecv($request);
-        $topicsMeta = [];
-        $retryTopics = [];
-        foreach ($response->getTopics() as $topicItem) {
-            $errorCode = $topicItem->getErrorCode();
-            if (ErrorCode::success($errorCode)) {
-                $topicsMeta[] = $topicItem;
-            } else {
-                switch ($topicItem->getErrorCode()) {
-                    case ErrorCode::UNKNOWN_TOPIC_OR_PARTITION:
-                    case ErrorCode::LEADER_NOT_AVAILABLE:
-                        $retryTopics[] = $topicItem->getName();
-                        break;
-                    default:
-                        ErrorCode::check($errorCode);
+        for ($attempt = 0; ; ++$attempt) {
+            $request = new MetadataRequest();
+            $topicsArray = [];
+            foreach ($topics as $topic) {
+                $topicsArray[] = (new MetadataRequestTopic())->setName($topic);
+            }
+            $request->setTopics($topicsArray ?: null);
+            $request->setAllowAutoTopicCreation($config->getAutoCreateTopic());
+            /** @var MetadataResponse $response */
+            $response = $client->sendRecv($request);
+            $expected = array_fill_keys($topics, true);
+            $seen = [];
+            $retryTopics = [];
+            foreach ($response->getTopics() as $topicItem) {
+                $name = $topicItem->getName();
+                if (isset($seen[$name]) || ($topics && !isset($expected[$name]))) {
+                    throw new \UnexpectedValueException('Unexpected metadata topic');
+                }
+                $seen[$name] = true;
+                unset($expected[$name]);
+                $errorCode = $topicItem->getErrorCode();
+                if (ErrorCode::success($errorCode)) {
+                    $metadata = [];
+                    foreach ($this->topicsMeta ?? [] as $existing) {
+                        $metadata[$existing->getName()] = $existing;
+                    }
+                    $metadata[$name] = $topicItem;
+                    $this->topicsMeta = array_values($metadata);
+                    if (!in_array($name, $this->metaUpdatedTopics, true)) {
+                        $this->metaUpdatedTopics[] = $name;
+                    }
+                } elseif ((ErrorCode::UNKNOWN_TOPIC_OR_PARTITION === $errorCode || ErrorCode::LEADER_NOT_AVAILABLE === $errorCode) && $attempt < $retry) {
+                    $retryTopics[] = $name;
+                } else {
+                    ErrorCode::check($errorCode);
                 }
             }
+            if ($expected) {
+                throw new \UnexpectedValueException('Missing metadata topic');
+            }
+            if (!$retryTopics) {
+                return $response;
+            }
+            $topics = $retryTopics;
+            if ($sleep > 0) {
+                usleep((int) ($sleep * 1000000));
+            }
         }
-        if ($this->topicsMeta) {
-            $this->topicsMeta = array_values(array_merge($this->topicsMeta, $topicsMeta));
-        } else {
-            $this->topicsMeta = $topicsMeta;
-        }
-        if ($this->metaUpdatedTopics) {
-            $this->metaUpdatedTopics = array_values(array_merge($this->metaUpdatedTopics, $topics));
-        } else {
-            $this->metaUpdatedTopics = $topics;
-        }
-
-        if ($retryTopics) {
-            return $this->updateMetadata($retryTopics, $client);
-        }
-
-        return $response;
     }
 
     public function getClient(?int $brokerId = null): ClientInterface
@@ -170,6 +184,8 @@ class Broker
         if (isset($this->clients[$brokerId])) {
             $client = $this->clients[$brokerId];
             if (!$client->getSocket()->isConnected()) {
+                $client->close();
+                unset($this->clients[$brokerId]);
                 $client = $this->setClientConnection($brokerId);
             }
         } else {
@@ -260,7 +276,12 @@ class Broker
         $clientClass = KafkaUtil::getClientClass($this->config->getClient());
         /** @var ClientInterface $client */
         $client = new $clientClass($url['host'], $url['port'] ?? 9092, $this->config, KafkaUtil::getSocketClass($this->config->getSocket()));
-        $client->connect();
+        try {
+            $client->connect();
+        } catch (\Throwable $exception) {
+            $client->close();
+            throw $exception;
+        }
         $this->clients[$brokerId] = $client;
 
         return $client;

@@ -84,6 +84,17 @@ class RecordBatch extends AbstractStruct
      */
     protected $records = [];
 
+    /** @var self[] */
+    private array $additionalBatches = [];
+
+    private bool $hasBatch = true;
+
+    /** @return self[] */
+    public function getBatches(): array
+    {
+        return $this->hasBatch ? array_merge([$this], $this->additionalBatches) : [];
+    }
+
     public function __construct()
     {
         $this->attributes = new Attributes();
@@ -142,19 +153,45 @@ class RecordBatch extends AbstractStruct
         $result .= Int32::pack(ProtocolUtil::int32(hexdec(ProtocolUtil::crc32c($data))));
         $result .= $data;
 
+        foreach ($this->additionalBatches as $batch) {
+            $result .= substr($batch->pack($apiVersion), 4);
+        }
         return String32::pack($result);
     }
 
     public function unpack(string $data, ?int &$size = null, int $apiVersion = 0): void
     {
-        $length = Int32::unpack($data, $tmpSize);
-        $size = $tmpSize;
-        if ($length <= 0) {
-            return;
+        if (strlen($data) < 4) {
+            throw new \UnexpectedValueException('Truncated record set length');
         }
-        $size += $length;
-        $data = substr($data, $tmpSize, $length);
+        $length = Int32::unpack($data);
+        if ($length < -1 || $length > strlen($data) - 4) {
+            throw new \UnexpectedValueException('Invalid record set length');
+        }
+        $this->additionalBatches = [];
+        $this->hasBatch = $length > 0;
+        $this->records = [];
+        $size = 4 + max($length, 0);
+        $cursor = 4;
+        while ($cursor < $size) {
+            if ($size - $cursor < 12) {
+                throw new \UnexpectedValueException('Truncated record batch header');
+            }
+            $batchLength = Int32::unpack(substr($data, $cursor + 8, 4));
+            if ($batchLength < 49 || $batchLength > $size - $cursor - 12) {
+                throw new \UnexpectedValueException('Invalid record batch length');
+            }
+            $batch = $cursor === 4 ? $this : new self();
+            $batch->unpackBatch(substr($data, $cursor, 12 + $batchLength), $apiVersion);
+            if ($batch !== $this) {
+                $this->additionalBatches[] = $batch;
+            }
+            $cursor += 12 + $batchLength;
+        }
+    }
 
+    private function unpackBatch(string $data, int $apiVersion): void
+    {
         $this->baseOffset = Int64::unpack($data, $tmpSize);
         $data = substr($data, $tmpSize);
 
@@ -166,6 +203,9 @@ class RecordBatch extends AbstractStruct
 
         $this->magic = Int8::unpack($data, $tmpSize);
         $data = substr($data, $tmpSize);
+        if ($this->magic !== 2) {
+            throw new \UnexpectedValueException('Unsupported record batch magic');
+        }
 
         $this->crc = Int32::unpack($data, $tmpSize);
         $data = substr($data, $tmpSize);
@@ -229,7 +269,22 @@ class RecordBatch extends AbstractStruct
                     throw new UnsupportedCompressionException(sprintf('Unsupport compression %s', $compression));
             }
         }
+        if (!is_string($data)) {
+            throw new \UnexpectedValueException('Invalid compressed record data');
+        }
+        $count = Int32::unpack($lengthBin);
+        if ($count < 0 || $count > intdiv(strlen($data), 7)) {
+            throw new \UnexpectedValueException('Invalid record count');
+        }
         $this->records = ArrayInt32::unpack($lengthBin . $data, $tmpSize, Record::class);
+        if ($tmpSize !== 4 + strlen($data)) {
+            throw new \UnexpectedValueException('Unexpected trailing record bytes');
+        }
+        foreach ($this->records as $record) {
+            if ($record->getOffsetDelta() < 0 || $record->getOffsetDelta() > $this->lastOffsetDelta) {
+                throw new \UnexpectedValueException('Invalid record offset delta');
+            }
+        }
     }
 
     public function toArray(): array

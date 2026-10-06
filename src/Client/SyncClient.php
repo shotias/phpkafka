@@ -7,6 +7,8 @@ namespace longlang\phpkafka\Client;
 use InvalidArgumentException;
 use longlang\phpkafka\Config\CommonConfig;
 use longlang\phpkafka\Exception\UnsupportedApiKeyException;
+use longlang\phpkafka\Exception\SocketException;
+use Throwable;
 use longlang\phpkafka\Exception\UnsupportedApiVersionException;
 use longlang\phpkafka\Protocol\AbstractRequest;
 use longlang\phpkafka\Protocol\AbstractResponse;
@@ -42,7 +44,7 @@ class SyncClient implements ClientInterface
     /**
      * @var array
      */
-    protected $waitResponseMaps;
+    protected $waitResponseMaps = [];
 
     /**
      * @var int
@@ -98,14 +100,21 @@ class SyncClient implements ClientInterface
 
     public function connect(): void
     {
-        $this->socket->connect();
-        $this->waitResponseMaps = [];
-        $this->updateApiVersions();
-        $this->sendAuthInfo();
+        $this->close();
+        try {
+            $this->socket->connect();
+            $this->updateApiVersions();
+            $this->sendAuthInfo();
+        } catch (Throwable $exception) {
+            $this->close();
+            throw $exception;
+        }
     }
 
     public function close(): bool
     {
+        $this->waitResponseMaps = [];
+
         return $this->socket->close();
     }
 
@@ -147,8 +156,11 @@ class SyncClient implements ClientInterface
             $header->setCorrelationId(++$this->correlationIdIncrValue);
         }
         $kafkaRequest = new KafkaRequest($request, $header);
-        $this->socket->send($kafkaRequest->pack());
+        $data = $kafkaRequest->pack();
         $correlationId = $header->getCorrelationId();
+        if (isset($this->waitResponseMaps[$correlationId])) {
+            throw new InvalidArgumentException('Correlation ID is already awaiting a response');
+        }
 
         if ($hasResponse) {
             $this->waitResponseMaps[$correlationId] = [
@@ -156,6 +168,15 @@ class SyncClient implements ClientInterface
                 'apiVersion'       => $header->getRequestApiVersion(),
                 'flexibleVersions' => $request->getFlexibleVersions(),
             ];
+        }
+
+        try {
+            if ($this->socket->send($data) !== \strlen($data)) {
+                throw new SocketException('Incomplete Kafka request write');
+            }
+        } catch (Throwable $exception) {
+            $this->close();
+            throw $exception;
         }
 
         return $correlationId;
@@ -167,15 +188,50 @@ class SyncClient implements ClientInterface
             throw new InvalidArgumentException(sprintf('Invalid correlationId %s', $correlationId));
         }
         $mapData = $this->waitResponseMaps[$correlationId];
-        $data = $this->socket->recv(4);
+        try {
+            return $this->decodeResponse($this->readResponseFrame(), $correlationId, $mapData, $header);
+        } catch (Throwable $exception) {
+            // No dispatcher in the synchronous client: an unmatched/partial frame
+            // makes the entire connection unsafe to reuse.
+            $this->close();
+            throw $exception;
+        } finally {
+            unset($this->waitResponseMaps[$correlationId]);
+        }
+    }
+
+    protected function readResponseFrame(?float $timeout = null): string
+    {
+        $data = $this->socket->recv(4, $timeout);
+        if (4 !== \strlen($data)) {
+            throw new SocketException('Incomplete Kafka response length');
+        }
         $length = Int32::unpack($data);
+        if ($length < 4 || $length > StreamSocket::READ_MAX_LENGTH) {
+            throw new SocketException('Invalid Kafka response length');
+        }
         $data = $this->socket->recv($length);
+        if (\strlen($data) !== $length) {
+            throw new SocketException('Incomplete Kafka response frame');
+        }
+
+        return $data;
+    }
+
+    protected function decodeResponse(string $data, int $correlationId, array $mapData, ?ResponseHeader &$header): AbstractResponse
+    {
         $header = new ResponseHeader();
         $header->unpack($data, $size, ResponseHeader::parseVersion($mapData['apiVersion'], $mapData['flexibleVersions']));
-        $data = substr($data, $size);
+        if ($header->getCorrelationId() !== $correlationId) {
+            throw new SocketException('Unexpected Kafka response correlation ID');
+        }
 
-        $result = ApiKeys::createResponse($mapData['apiKey'], $data, $mapData['apiVersion']);
-        unset($this->waitResponseMaps[$correlationId]);
+        $body = substr($data, $size);
+        $result = ApiKeys::createResponse($mapData['apiKey']);
+        $result->unpack($body, $bodySize, $mapData['apiVersion']);
+        if ($bodySize !== \strlen($body)) {
+            throw new SocketException('Incomplete or trailing Kafka response body');
+        }
 
         return $result;
     }

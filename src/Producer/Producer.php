@@ -134,28 +134,13 @@ class Producer
             $topicData->setPartitions($partitions);
         }
         $produceRetry = $config->getProduceRetry();
+        if ($produceRetry < 0) {
+            throw new \InvalidArgumentException('produceRetry must not be negative');
+        }
         $produceRetrySleep = $config->getProduceRetrySleep();
         foreach ($topicsMap as $brokerId => $topics) {
-            $retryTopics = [];
-            for ($retryCount = 0; $retryCount <= $produceRetry; ++$retryCount) {
-                if ($retryTopics) {
-                    foreach ($topics as $k => $v) {
-                        $name = $v->getName();
-                        if (isset($retryTopics[$name])) {
-                            $partitions = $v->getPartitions();
-                            foreach ($partitions as $i => $partition) {
-                                if (!\in_array($partition->getPartitionIndex(), $retryTopics[$name])) {
-                                    unset($partitions[$i]);
-                                }
-                            }
-                            $v->setPartitions($partitions);
-                        } else {
-                            unset($topics[$k]);
-                        }
-                    }
-                }
-                $request->setTopics($topics);
-
+            for ($retryCount = 0; ; ++$retryCount) {
+                $request->setTopics(array_values($topics));
                 $hasResponse = 0 !== $acks;
                 $client = $broker->getClient($brokerId);
                 $correlationId = $client->send($request, null, $hasResponse);
@@ -164,25 +149,59 @@ class Producer
                 }
                 /** @var ProduceResponse $response */
                 $response = $client->recv($correlationId);
+                $expected = [];
+                foreach ($topics as $topic) {
+                    foreach ($topic->getPartitions() as $partition) {
+                        $expected[$topic->getName()][$partition->getPartitionIndex()] = true;
+                    }
+                }
                 $retryTopics = [];
-                foreach ($response->getResponses() as $response) {
-                    $topicName = $response->getName();
-                    foreach ($response->getPartitions() as $partition) {
-                        $errorCode = $partition->getErrorCode();
-                        switch ($errorCode) {
-                            case ErrorCode::UNKNOWN_TOPIC_OR_PARTITION:
-                            case ErrorCode::LEADER_NOT_AVAILABLE:
-                                $retryTopics[$topicName][] = $partition->getPartitionIndex();
-                                break;
-                            default:
-                                ErrorCode::check($errorCode);
+                $seenTopics = [];
+                foreach ($response->getResponses() as $topicResponse) {
+                    $name = $topicResponse->getName();
+                    if (!isset($topics[$name]) || isset($seenTopics[$name])) {
+                        throw new \UnexpectedValueException('Unexpected or duplicate produce response topic');
+                    }
+                    $seenTopics[$name] = true;
+                    foreach ($topicResponse->getPartitions() as $partition) {
+                        $name = $topicResponse->getName();
+                        $index = $partition->getPartitionIndex();
+                        if (!isset($expected[$name][$index])) {
+                            throw new \UnexpectedValueException('Unexpected or duplicate produce response partition');
                         }
+                        unset($expected[$name][$index]);
+                        $errorCode = $partition->getErrorCode();
+                        if (ErrorCode::UNKNOWN_TOPIC_OR_PARTITION === $errorCode || ErrorCode::LEADER_NOT_AVAILABLE === $errorCode) {
+                            if ($retryCount >= $produceRetry) {
+                                ErrorCode::check($errorCode);
+                            }
+                            $retryTopics[$name][$index] = true;
+                        } else {
+                            ErrorCode::check($errorCode);
+                        }
+                    }
+                }
+                foreach ($expected as $partitions) {
+                    if ($partitions) {
+                        throw new \UnexpectedValueException('Missing produce response partition');
                     }
                 }
                 if (!$retryTopics) {
                     break;
                 }
-                usleep((int) ($produceRetrySleep * 1000000));
+                foreach ($topics as $name => $topic) {
+                    $partitions = array_filter($topic->getPartitions(), static function ($partition) use ($retryTopics, $name) {
+                        return isset($retryTopics[$name][$partition->getPartitionIndex()]);
+                    });
+                    if ($partitions) {
+                        $topic->setPartitions(array_values($partitions));
+                    } else {
+                        unset($topics[$name]);
+                    }
+                }
+                if ($produceRetrySleep > 0) {
+                    usleep((int) ($produceRetrySleep * 1000000));
+                }
             }
         }
     }
