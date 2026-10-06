@@ -41,14 +41,49 @@ class ConsumeMessage
     /**
      * @param RecordHeader[] $headers
      */
-    public function __construct(Consumer $consumer, string $topic, int $partition, ?string $key, ?string $value, array $headers)
+    private readonly Consumer $sourceConsumer;
+
+    private readonly string $sourceTopic;
+
+    private readonly int $sourcePartition;
+
+    public function __construct(
+        Consumer $consumer,
+        string $topic,
+        int $partition,
+        ?string $key,
+        ?string $value,
+        array $headers,
+        private readonly ?int $offset = null,
+        private readonly ?int $assignmentId = null
+    )
     {
+        $this->sourceConsumer = $consumer;
+        $this->sourceTopic = $topic;
+        $this->sourcePartition = $partition;
         $this->consumer = $consumer;
         $this->topic = $topic;
         $this->partition = $partition;
         $this->key = $key;
         $this->value = $value;
         $this->headers = $headers;
+    }
+
+    public function isFrom(Consumer $consumer, int $assignmentId): bool
+    {
+        return $this->sourceConsumer === $consumer && $this->consumer === $consumer
+            && $this->sourceTopic === $this->topic && $this->sourcePartition === $this->partition
+            && $this->assignmentId === $assignmentId;
+    }
+
+    public function getOffset(): ?int
+    {
+        return $this->offset;
+    }
+
+    public function getAssignmentId(): ?int
+    {
+        return $this->assignmentId;
     }
 
     public function getConsumer(): Consumer

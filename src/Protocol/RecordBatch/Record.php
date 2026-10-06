@@ -57,6 +57,9 @@ class Record extends AbstractStruct
 
     public function pack(int $apiVersion = 0): string
     {
+        if ($this->timestampDelta < VarInt::MIN_VALUE || $this->timestampDelta > VarInt::MAX_VALUE) {
+            throw new \InvalidArgumentException('Timestamp delta exceeds the native signed 32-bit range');
+        }
         $data = '';
         $data .= Int8::pack($this->attributes);
         $data .= VarInt::pack($this->timestampDelta);
@@ -83,40 +86,68 @@ class Record extends AbstractStruct
 
     public function unpack(string $data, ?int &$size = null, int $apiVersion = 0): void
     {
-        $size = 0;
-        if ('' === $data) {
-            return;
+        $cursor = 0;
+        $this->length = $length = self::readVarInt($data, $cursor);
+        if ($length < 6 || $length > strlen($data) - $cursor) {
+            throw new \UnexpectedValueException('Invalid record body length');
         }
-        $this->length = $length = VarInt::unpack($data, $tmpSize);
-        $data = substr($data, $tmpSize);
-        $size = $tmpSize + $length;
-
-        $this->attributes = Int8::unpack($data, $tmpSize);
-        $data = substr($data, $tmpSize);
-
-        $this->timestampDelta = VarInt::unpack($data, $tmpSize);
-        $data = substr($data, $tmpSize);
-
-        $this->offsetDelta = VarInt::unpack($data, $tmpSize);
-        $data = substr($data, $tmpSize);
-
-        $len = VarInt::unpack($data, $tmpSize);
-        if ($len > 0) {
-            $this->key = substr($data, $tmpSize, $len);
-            $data = substr($data, $tmpSize + $len);
-        } else {
-            $data = substr($data, $tmpSize);
+        $size = $cursor + $length;
+        $body = substr($data, $cursor, $length);
+        $cursor = 1;
+        $this->attributes = Int8::unpack($body);
+        // The inherited native VarInt primitive supports signed 32-bit deltas only.
+        $this->timestampDelta = self::readVarInt($body, $cursor);
+        $this->offsetDelta = self::readVarInt($body, $cursor);
+        $this->key = self::readBytes($body, $cursor);
+        $this->value = self::readBytes($body, $cursor);
+        $count = self::readVarInt($body, $cursor);
+        if ($count < 0 || $count > intdiv(strlen($body) - $cursor, 2)) {
+            throw new \UnexpectedValueException('Invalid record header count');
         }
-
-        $len = VarInt::unpack($data, $tmpSize);
-        if ($len > 0) {
-            $this->value = substr($data, $tmpSize, $len);
-            $data = substr($data, $tmpSize + $len);
-        } else {
-            $data = substr($data, $tmpSize);
+        $this->headers = [];
+        for ($i = 0; $i < $count; ++$i) {
+            $key = self::readBytes($body, $cursor);
+            $value = self::readBytes($body, $cursor);
+            if ($key === null || $value === null) {
+                throw new \UnexpectedValueException('Null record headers are unsupported by the native header API');
+            }
+            $this->headers[] = (new RecordHeader())->setHeaderKey($key)->setValue($value);
         }
+        if ($cursor !== strlen($body)) {
+            throw new \UnexpectedValueException('Unexpected trailing record body bytes');
+        }
+    }
 
-        $this->headers = VarIntCompactArray::unpack($data, $tmpSize, RecordHeader::class) ?? [];
+    private static function readVarInt(string $data, int &$cursor): int
+    {
+        $start = $cursor;
+        for ($i = 0; $i < 5; ++$i) {
+            if (!isset($data[$cursor])) {
+                throw new \UnexpectedValueException('Truncated record varint');
+            }
+            $byte = ord($data[$cursor++]);
+            if ($i === 4 && $byte > 15) {
+                throw new \UnexpectedValueException('Record varint exceeds the native 32-bit range');
+            }
+            if (($byte & 128) === 0) {
+                return VarInt::unpack(substr($data, $start, $cursor - $start));
+            }
+        }
+        throw new \UnexpectedValueException('Invalid record varint');
+    }
+
+    private static function readBytes(string $data, int &$cursor): ?string
+    {
+        $length = self::readVarInt($data, $cursor);
+        if ($length < -1 || $length > strlen($data) - $cursor) {
+            throw new \UnexpectedValueException('Invalid record field length');
+        }
+        if ($length === -1) {
+            return null;
+        }
+        $value = substr($data, $cursor, $length);
+        $cursor += $length;
+        return $value;
     }
 
     public function toArray(): array

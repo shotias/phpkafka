@@ -101,12 +101,28 @@ class OffsetManager
         $response = KafkaUtil::retry($client, $request, $retry, 0);
 
         $metadatas = $offsets = [];
+        if (count($response->getTopics()) !== 1) {
+            throw new \UnexpectedValueException('Unexpected offset fetch topic count');
+        }
         foreach ($response->getTopics() as $topic) {
+            if ($topic->getName() !== $this->topic) {
+                throw new \UnexpectedValueException('Unexpected offset fetch topic');
+            }
             foreach ($topic->getPartitions() as $partition) {
+                ErrorCode::check($partition->getErrorCode());
                 $partitionIndex = $partition->getPartitionIndex();
+                if (!in_array($partitionIndex, $this->partitions, true) || isset($offsets[$partitionIndex])) {
+                    throw new \UnexpectedValueException('Unexpected offset fetch partition');
+                }
+                if ($partition->getCommittedOffset() < -1) {
+                    throw new \UnexpectedValueException('Invalid committed offset');
+                }
                 $offsets[$partitionIndex] = max($partition->getCommittedOffset(), 0);
                 $metadatas[$partitionIndex] = $partition->getMetadata();
             }
+        }
+        if (count($offsets) !== count($this->partitions)) {
+            throw new \UnexpectedValueException('Missing offset fetch partition');
         }
         $this->offsets = $offsets;
         $this->metadatas = $metadatas;
@@ -208,35 +224,47 @@ class OffsetManager
 
     public function saveOffsets(int $partition, int $retry = 0): void
     {
+        $this->commitOffset($partition, $this->getFetchOffset($partition), $retry);
+    }
+
+    /**
+     * Commit an explicit next record offset; local position changes only after confirmation.
+     */
+    public function commitOffset(int $partition, int $offset, int $retry = 0): void
+    {
+        if ($retry < 0 || $offset < $this->getFetchOffset($partition)) {
+            throw new \InvalidArgumentException('Invalid offset commit or retry budget');
+        }
         $request = new OffsetCommitRequest();
         $request->setGroupId($this->groupId);
         $request->setGroupInstanceId($this->groupInstanceId);
         $request->setMemberId($this->memberId);
         $request->setGenerationId($this->generationId);
-        $topic = (new OffsetCommitRequestTopic())->setName($this->topic);
-        $request->setTopics([$topic]);
-
-        $timestamp = (int) (microtime(true) * 1000);
-        $offset = $this->getFetchOffset($partition);
-        $topic->setPartitions([
-            (new OffsetCommitRequestPartition())->setPartitionIndex($partition)->setCommittedOffset($offset)->setCommitTimestamp($timestamp)->setCommittedMetadata($this->metadatas[$partition]),
+        $request->setTopics([
+            (new OffsetCommitRequestTopic())->setName($this->topic)->setPartitions([
+                (new OffsetCommitRequestPartition())->setPartitionIndex($partition)
+                    ->setCommittedOffset($offset)->setCommitTimestamp((int) (microtime(true) * 1000))
+                    ->setCommittedMetadata($this->metadatas[$partition]),
+            ]),
         ]);
-
-        $broker = $this->broker;
-        for ($i = 0; $i <= $retry; ++$i) {
+        for ($i = 0; ; ++$i) {
             /** @var OffsetCommitResponse $response */
-            $response = $broker->getClientByBrokerId($this->coordinatorNodeId)->sendRecv($request);
-            foreach ($response->getTopics() as $topic) {
-                foreach ($topic->getPartitions() as $topicPartition) {
-                    $errorCode = $topicPartition->getErrorCode();
-                    if (ErrorCode::success($errorCode)) {
-                        return;
-                    }
-                    if (ErrorCode::canRetry($errorCode)) {
-                        continue 3;
-                    }
-                    ErrorCode::check($errorCode);
-                }
+            $response = $this->broker->getClientByBrokerId($this->coordinatorNodeId)->sendRecv($request);
+            $topics = $response->getTopics();
+            if (1 !== count($topics) || $topics[0]->getName() !== $this->topic) {
+                throw new \UnexpectedValueException('Unexpected offset commit topic response');
+            }
+            $partitions = $topics[0]->getPartitions();
+            if (1 !== count($partitions) || $partitions[0]->getPartitionIndex() !== $partition) {
+                throw new \UnexpectedValueException('Unexpected offset commit partition response');
+            }
+            $errorCode = $partitions[0]->getErrorCode();
+            if (ErrorCode::success($errorCode)) {
+                $this->offsets[$partition] = $offset;
+                return;
+            }
+            if ($i >= $retry || !ErrorCode::canRetry($errorCode)) {
+                ErrorCode::check($errorCode);
             }
         }
     }

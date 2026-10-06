@@ -115,6 +115,23 @@ class Consumer
      */
     protected $timer;
 
+    private ?ConsumeMessage $pendingMessage = null;
+
+    /** @var array{string, int, int}|null */
+    private ?array $pendingPosition = null;
+
+    private int $assignmentId = 0;
+
+    private ?ConsumeMessage $lastAcknowledged = null;
+
+    private bool $acknowledging = false;
+
+    private bool $closed = false;
+
+    private bool $rejoining = false;
+
+    private bool $needsRejoin = false;
+
     public function __construct(ConsumerConfig $config, ?callable $consumeCallback = null)
     {
         $this->config = $config;
@@ -143,72 +160,119 @@ class Consumer
 
     public function rejoin(): void
     {
-        rejoinBegin:
+        if ($this->closed) {
+            throw new \LogicException('Consumer is closed');
+        }
+        if ($this->rejoining) {
+            throw new \RuntimeException('Consumer rejoin already in progress');
+        }
+        $retry = $this->config->getGroupRetry();
+        if ($retry < 0) {
+            throw new InvalidArgumentException('groupRetry must not be negative');
+        }
+        $this->rejoining = true;
+        $this->needsRejoin = true;
+        $assignmentId = ++$this->assignmentId;
+        $this->messages = [];
+        $this->pendingMessage = null;
+        $this->pendingPosition = null;
+        $this->lastAcknowledged = null;
+        $this->offsetManagers = [];
+        $this->fetchOptions = [];
         try {
-            $this->stopHeartbeat();
+            for ($attempt = 0; ; ++$attempt) {
+                try {
+                    $this->stopHeartbeat();
 
-            $config = $this->config;
-            $groupManager = $this->groupManager;
-            $groupId = $config->getGroupId();
-            $topics = $config->getTopic();
+                    $config = $this->config;
+                    $groupManager = $this->groupManager;
+                    $groupId = $config->getGroupId();
+                    $topics = $config->getTopic();
 
-            $metadata = new ConsumerGroupMemberMetadata();
-            $metadata->setTopics($config->getTopic());
-            $metadataContent = $metadata->pack();
-            $protocolName = 'group';
-            $protocols = [
-                (new JoinGroupRequestProtocol())->setName($protocolName)->setMetadata($metadataContent),
-            ];
+                    $metadata = new ConsumerGroupMemberMetadata();
+                    $metadata->setTopics($config->getTopic());
+                    $metadataContent = $metadata->pack();
+                    $protocolName = 'group';
+                    $protocols = [
+                        (new JoinGroupRequestProtocol())->setName($protocolName)->setMetadata($metadataContent),
+                    ];
 
-            // joinGroup
-            $response = $groupManager->joinGroup($groupId, $config->getMemberId(), ProtocolType::CONSUMER, $config->getGroupInstanceId(), $protocols, (int) ($config->getSessionTimeout() * 1000), (int) ($config->getRebalanceTimeout() * 1000), $config->getGroupRetry(), $config->getGroupRetrySleep());
-            $this->memberId = $response->getMemberId();
-            $this->generationId = $response->getGenerationId();
+                    // joinGroup
+                    $response = $groupManager->joinGroup($groupId, $config->getMemberId(), ProtocolType::CONSUMER, $config->getGroupInstanceId(), $protocols, (int) ($config->getSessionTimeout() * 1000), (int) ($config->getRebalanceTimeout() * 1000), $config->getGroupRetry(), $config->getGroupRetrySleep());
+                    $this->ensureAssignment($assignmentId);
+                    $this->memberId = $response->getMemberId();
+                    $this->generationId = $response->getGenerationId();
 
-            // syncGroup
-            if ($this->groupManager->isLeader()) {
-                $assignorClass = $config->getPartitionAssignmentStrategy();
-                /** @var PartitionAssignorInterface $assignor */
-                $assignor = $this->assignor = new $assignorClass();
-                $assignments = $assignor->assign($this->broker->getTopicsMeta(), $this->groupManager->getJoinGroupResponse()->getMembers());
-                $response = $groupManager->syncGroup($groupId, $config->getGroupInstanceId(), $this->memberId, $this->generationId, $protocolName, ProtocolType::CONSUMER, $assignments, $config->getGroupRetry(), $config->getGroupRetrySleep());
-            } else {
-                $response = $groupManager->syncGroup($groupId, $config->getGroupInstanceId(), $this->memberId, $this->generationId, $protocolName, ProtocolType::CONSUMER, [], $config->getGroupRetry(), $config->getGroupRetrySleep());
+                    // syncGroup
+                    if ($this->groupManager->isLeader()) {
+                        $assignorClass = $config->getPartitionAssignmentStrategy();
+                        /** @var PartitionAssignorInterface $assignor */
+                        $assignor = $this->assignor = new $assignorClass();
+                        $assignments = $assignor->assign($this->broker->getTopicsMeta(), $this->groupManager->getJoinGroupResponse()->getMembers());
+                        $response = $groupManager->syncGroup($groupId, $config->getGroupInstanceId(), $this->memberId, $this->generationId, $protocolName, ProtocolType::CONSUMER, $assignments, $config->getGroupRetry(), $config->getGroupRetrySleep());
+                    } else {
+                        $response = $groupManager->syncGroup($groupId, $config->getGroupInstanceId(), $this->memberId, $this->generationId, $protocolName, ProtocolType::CONSUMER, [], $config->getGroupRetry(), $config->getGroupRetrySleep());
+                    }
+
+                    $this->ensureAssignment($assignmentId);
+                    $this->consumerGroupMemberAssignment = $consumerGroupMemberAssignment = new ConsumerGroupMemberAssignment();
+                    $data = $response->getAssignment();
+                    if ('' !== $data) {
+                        $consumerGroupMemberAssignment->unpack($data);
+                    }
+
+                    $this->initFetchOptions();
+
+                    foreach ($topics as $topic) {
+                        $this->offsetManagers[$topic] = $offsetManager = new OffsetManager($this->broker, $this->coordinator->getNodeId(), $topic, $this->getPartitions($topic), $groupId, $config->getGroupInstanceId(), $this->memberId, $this->generationId);
+                        $offsetManager->updateOffsets($config->getOffsetRetry());
+                        $this->ensureAssignment($assignmentId);
+                    }
+
+                    $this->ensureAssignment($assignmentId);
+                    $this->startHeartbeat();
+                    $this->needsRejoin = false;
+                    return;
+                } catch (KafkaErrorException $exception) {
+                    if (ErrorCode::REBALANCE_IN_PROGRESS !== $exception->getCode() || $attempt >= $retry) {
+                        throw $exception;
+                    }
+                }
             }
+        } finally {
+            $this->rejoining = false;
+        }
+    }
 
-            $this->consumerGroupMemberAssignment = $consumerGroupMemberAssignment = new ConsumerGroupMemberAssignment();
-            $data = $response->getAssignment();
-            if ('' !== $data) {
-                $consumerGroupMemberAssignment->unpack($data);
-            }
-
-            $this->initFetchOptions();
-
-            foreach ($topics as $topic) {
-                $this->offsetManagers[$topic] = $offsetManager = new OffsetManager($this->broker, $this->coordinator->getNodeId(), $topic, $this->getPartitions($topic), $groupId, $config->getGroupInstanceId(), $this->memberId, $this->generationId);
-                $offsetManager->updateOffsets($config->getOffsetRetry());
-            }
-
-            $this->startHeartbeat();
-        } catch (KafkaErrorException $ke) {
-            switch ($ke->getCode()) {
-                case ErrorCode::REBALANCE_IN_PROGRESS:
-                    goto rejoinBegin;
-                default:
-                    throw $ke;
-            }
+    private function ensureAssignment(int $assignmentId): void
+    {
+        if ($this->closed || $assignmentId !== $this->assignmentId) {
+            throw new \LogicException('Consumer assignment changed during rejoin');
         }
     }
 
     public function close(): void
     {
-        $config = $this->config;
-        $groupId = $config->getGroupId();
-        if (null !== $groupId) {
-            $this->groupManager->leaveGroup($groupId, $this->memberId, $config->getGroupInstanceId(), $config->getGroupRetry(), $config->getGroupRetrySleep());
+        if ($this->closed) {
+            return;
         }
-        $this->broker->close();
+        $this->closed = true;
+        $this->stop();
+        ++$this->assignmentId;
+        $this->messages = [];
+        $this->pendingMessage = null;
+        $this->pendingPosition = null;
+        $this->lastAcknowledged = null;
         $this->stopHeartbeat();
+        try {
+            $config = $this->config;
+            $groupId = $config->getGroupId();
+            if (null !== $groupId) {
+                $this->groupManager->leaveGroup($groupId, $this->memberId, $config->getGroupInstanceId(), $config->getGroupRetry(), $config->getGroupRetrySleep());
+            }
+        } finally {
+            $this->broker->close();
+        }
     }
 
     public function start(): void
@@ -244,20 +308,56 @@ class Consumer
 
     public function consume(): ?ConsumeMessage
     {
+        if ($this->closed) {
+            throw new \LogicException('Consumer is closed');
+        }
+        if ($this->needsRejoin) {
+            $this->rejoin();
+        }
+        // Do not pass an unconfirmed record, including after a callback or ACK exception.
+        if ($this->pendingMessage !== null) {
+            return $this->pendingMessage;
+        }
         if ([] === $this->messages) {
             $this->fetchMessages();
         }
         $message = array_shift($this->messages);
-
+        if ($message !== null) {
+            $this->pendingMessage = $message;
+            $this->pendingPosition = [$message->getTopic(), $message->getPartition(), $message->getOffset()];
+        }
         return $message;
     }
 
     public function ack(ConsumeMessage $message): void
     {
-        $offsetManager = $this->getOffsetManager($message->getTopic());
+        $offset = $message->getOffset();
+        if (!$message->isFrom($this, $this->assignmentId)
+            || $offset === null || $offset < 0 || $offset === PHP_INT_MAX || $this->needsRejoin || $this->closed) {
+            throw new \LogicException('Cannot acknowledge a foreign, stale or unpositioned message');
+        }
+        if ($this->lastAcknowledged === $message) {
+            return;
+        }
         $partition = $message->getPartition();
-        $offsetManager->addFetchOffset($partition);
-        $offsetManager->saveOffsets($partition, $this->config->getOffsetRetry());
+        if ($this->acknowledging || $this->pendingMessage !== $message
+            || $this->pendingPosition !== [$message->getTopic(), $partition, $offset]) {
+            throw new \LogicException('Only the unchanged outstanding message can be acknowledged');
+        }
+        $offsetManager = $this->getOffsetManager($message->getTopic());
+        $assignmentId = $this->assignmentId;
+        $this->acknowledging = true;
+        try {
+            $offsetManager->commitOffset($partition, $offset + 1, $this->config->getOffsetRetry());
+            if ($assignmentId !== $this->assignmentId || $this->pendingMessage !== $message) {
+                throw new \LogicException('Consumer assignment changed during acknowledgement');
+            }
+            $this->lastAcknowledged = $message;
+            $this->pendingMessage = null;
+            $this->pendingPosition = null;
+        } finally {
+            $this->acknowledging = false;
+        }
     }
 
     protected function initFetchOptions(): void
@@ -324,8 +424,12 @@ class Consumer
         }
         $request->setTopics($topics);
 
+        $assignmentId = $this->assignmentId;
         /** @var FetchResponse $response */
         $response = $this->broker->getClient($nodeId)->sendRecv($request);
+        if ($assignmentId !== $this->assignmentId || $this->needsRejoin) {
+            return;
+        }
         $errorCode = $response->getErrorCode();
         switch ($errorCode) {
             case ErrorCode::REBALANCE_IN_PROGRESS:
@@ -337,14 +441,25 @@ class Consumer
         }
 
         $messages = [];
+        $expected = [];
+        foreach ($currentList as $topicName => $partitions) {
+            $expected[$topicName] = array_fill_keys($partitions, true);
+        }
+        $seenTopics = [];
         foreach ($response->getTopics() as $topic) {
-            $needUpdatePartitions = [];
+            if (!isset($expected[$topic->getName()]) || isset($seenTopics[$topic->getName()])) {
+                throw new \UnexpectedValueException('Unexpected or duplicate fetch response topic');
+            }
+            $seenTopics[$topic->getName()] = true;
             foreach ($topic->getPartitions() as $partition) {
+                $topicName = $topic->getName();
+                $partitionIndex = $partition->getPartitionIndex();
+                if (!isset($expected[$topicName][$partitionIndex])) {
+                    throw new \UnexpectedValueException('Unexpected or duplicate fetch response partition');
+                }
+                unset($expected[$topicName][$partitionIndex]);
                 $errorCode = $partition->getErrorCode();
                 switch ($errorCode) {
-                    case ErrorCode::OFFSET_OUT_OF_RANGE:
-                        $needUpdatePartitions[] = $partition->getPartitionIndex();
-                        break;
                     case ErrorCode::UNKNOWN_TOPIC_OR_PARTITION:
                     case ErrorCode::LEADER_NOT_AVAILABLE:
                     case ErrorCode::NOT_LEADER_OR_FOLLOWER:
@@ -354,14 +469,38 @@ class Consumer
                         return;
                     default:
                         ErrorCode::check($errorCode);
-                        foreach ($partition->getRecords()->getRecords() as $record) {
-                            $messages[] = new ConsumeMessage($this, $topic->getName(), $partition->getPartitionIndex(), $record->getKey(), $record->getValue(), $record->getHeaders());
+                        $partitionIndex = $partition->getPartitionIndex();
+                        $fetchOffset = $this->getOffsetManager($topic->getName())->getFetchOffset($partitionIndex);
+                        $previousOffset = -1;
+                        foreach ($partition->getRecords()->getBatches() as $batch) {
+                            if (!$batch->getRecords() || $batch->getAttributes()->getIsControlBatch()
+                                || $batch->getAttributes()->getIsTransactional()) {
+                                throw new \UnexpectedValueException('Empty compacted or transactional batches require an explicit consumer policy');
+                            }
+                            foreach ($batch->getRecords() as $record) {
+                                $base = $batch->getBaseOffset();
+                                $delta = $record->getOffsetDelta();
+                                if ($base < 0 || $delta < 0 || $base >= PHP_INT_MAX - $delta) {
+                                    throw new \UnexpectedValueException('Invalid record offset');
+                                }
+                                $offset = $base + $delta;
+                                if ($offset <= $previousOffset) {
+                                    throw new \UnexpectedValueException('Non-increasing record offsets');
+                                }
+                                $previousOffset = $offset;
+                                if ($offset < $fetchOffset) {
+                                    continue;
+                                }
+                                $messages[] = new ConsumeMessage($this, $topic->getName(), $partitionIndex,
+                                    $record->getKey(), $record->getValue(), $record->getHeaders(), $offset, $assignmentId);
+                            }
                         }
                 }
             }
-            if ($needUpdatePartitions) {
-                $offsetManager = $this->getOffsetManager($topic->getName());
-                $offsetManager->updateListOffsets($needUpdatePartitions);
+        }
+        foreach ($expected as $partitions) {
+            if ($partitions) {
+                throw new \UnexpectedValueException('Missing fetch response partition');
             }
         }
         $this->messages = $messages;
