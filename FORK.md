@@ -142,3 +142,32 @@ while an old operation is suspended and verify the replacement socket and its
 buffer survive. This adds no writer pool or connection engine. SyncClient's
 StreamSocket remains a synchronous adapter; no Swoole hook behavior is claimed
 for that adapter.
+
+## Failed consumer construction cleanup (2026-10-06)
+
+Consumer construction now owns cleanup when bootstrap metadata, topic metadata,
+coordinator discovery or group joining fails before an instance can be returned.
+It stops consumption, clears any acquired heartbeat timer and closes all stored
+Broker clients without sending LeaveGroup for a partially initialized member.
+The original failure object is rethrown even when cleanup also fails.
+
+Broker close detaches its active client collection, attempts every client close
+and then reports the first cleanup failure. Failed closes remain owned in a
+separate pending-cleanup collection for later explicit retry; successful closes
+are removed. A newer active connection created while cleanup yields is not
+overwritten by an older failed close. Reentrant/concurrent close attempts reject
+while the current close owns its snapshot. Temporary bootstrap and unpublished connection
+cleanup likewise preserve an already-active connection/metadata failure; a
+cleanup-only failure remains visible. Both native clients preserve primary
+transport/protocol errors across failing cleanup. The Swoole receiver still
+notifies waiters and its configured callback with the original read error;
+callback exceptions remain visible. Successful construction, ACK behavior and
+the existing bounded native close/join implementation are unchanged.
+
+The existing standalone checks add constructor stage, multiple-client, timer,
+cleanup precedence and explicit-close controls. The Swoole check additionally
+constructs the actual Consumer against a scripted TCP coordinator failure and
+requires its owned socket/receiver to close or become collectible. These checks
+prove native resource ownership and failure precedence, not real Kafka or Hyperf
+process restart. Consuming applications must separately rebuild and verify that
+failed construction allows their native process supervisor to restart.

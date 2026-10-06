@@ -34,6 +34,16 @@ class Broker
     protected $clients = [];
 
     /**
+     * Clients whose cleanup has not completed, keyed by object identity.
+     *
+     * @var ClientInterface[]
+     */
+    private $pendingCloseClients = [];
+
+    /** @var bool */
+    private $closing = false;
+
+    /**
      * @var MetadataResponseTopic[]
      */
     protected $topicsMeta;
@@ -53,10 +63,33 @@ class Broker
 
     public function close(): void
     {
-        foreach ($this->clients as $client) {
-            $client->close();
+        if ($this->closing) {
+            throw new \LogicException('Broker close already in progress');
         }
-        $this->clients = [];
+        $this->closing = true;
+        try {
+            foreach ($this->clients as $client) {
+                $this->pendingCloseClients[spl_object_id($client)] = $client;
+            }
+            $this->clients = [];
+            $clients = $this->pendingCloseClients;
+            $failure = null;
+            foreach ($clients as $id => $client) {
+                try {
+                    $client->close();
+                    unset($this->pendingCloseClients[$id]);
+                } catch (\Throwable $exception) {
+                    // Retain ownership for an explicit retry. New active connections
+                    // created while close yields remain in their separate broker map.
+                    $failure = $failure ?? $exception;
+                }
+            }
+            if (null !== $failure) {
+                throw $failure;
+            }
+        } finally {
+            $this->closing = false;
+        }
     }
 
     public function updateBrokers(): void
@@ -85,11 +118,20 @@ class Broker
         $clientClass = KafkaUtil::getClientClass($config->getClient());
         /** @var ClientInterface $client */
         $client = new $clientClass($url['host'], $url['port'] ?? 9092, $config, KafkaUtil::getSocketClass($config->getSocket()));
+        $metadataCompleted = false;
         try {
             $client->connect();
             $response = $this->updateMetadata([], $client);
+            $metadataCompleted = true;
         } finally {
-            $client->close();
+            try {
+                $client->close();
+            } catch (\Throwable $cleanupFailure) {
+                if ($metadataCompleted) {
+                    throw $cleanupFailure;
+                }
+                // A connect/metadata failure is already unwinding; preserve it.
+            }
         }
 
         $brokers = [];
@@ -279,7 +321,11 @@ class Broker
         try {
             $client->connect();
         } catch (\Throwable $exception) {
-            $client->close();
+            try {
+                $client->close();
+            } catch (\Throwable $cleanupFailure) {
+                // The unpublished client's original connect failure takes precedence.
+            }
             throw $exception;
         }
         $this->clients[$brokerId] = $client;

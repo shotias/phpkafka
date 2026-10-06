@@ -106,7 +106,11 @@ class SyncClient implements ClientInterface
             $this->updateApiVersions();
             $this->sendAuthInfo();
         } catch (Throwable $exception) {
-            $this->close();
+            try {
+                $this->close();
+            } catch (Throwable $cleanupException) {
+                // Cleanup must not replace the original transport/protocol failure.
+            }
             throw $exception;
         }
     }
@@ -175,7 +179,11 @@ class SyncClient implements ClientInterface
                 throw new SocketException('Incomplete Kafka request write');
             }
         } catch (Throwable $exception) {
-            $this->close();
+            try {
+                $this->close();
+            } catch (Throwable $cleanupException) {
+                // Cleanup must not replace the original transport/protocol failure.
+            }
             throw $exception;
         }
 
@@ -193,7 +201,11 @@ class SyncClient implements ClientInterface
         } catch (Throwable $exception) {
             // No dispatcher in the synchronous client: an unmatched/partial frame
             // makes the entire connection unsafe to reuse.
-            $this->close();
+            try {
+                $this->close();
+            } catch (Throwable $cleanupException) {
+                // Cleanup must not replace the original transport/protocol failure.
+            }
             throw $exception;
         } finally {
             unset($this->waitResponseMaps[$correlationId]);

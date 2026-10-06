@@ -110,7 +110,11 @@ class SwooleClient extends SyncClient
             }
         } catch (Throwable $exception) {
             if ($connectionId === $this->connectionId) {
-                $this->close();
+                try {
+                    $this->close();
+                } catch (Throwable $cleanupException) {
+                    // Preserve the failure already being returned to the caller.
+                }
             }
             throw $exception;
         }
@@ -141,7 +145,11 @@ class SwooleClient extends SyncClient
             return $this->decodeResponse($data, $correlationId, $mapData, $header);
         } catch (Throwable $exception) {
             if ($connectionId === $this->connectionId) {
-                $this->close();
+                try {
+                    $this->close();
+                } catch (Throwable $cleanupException) {
+                    // Preserve the failure already being returned to the caller.
+                }
             }
             throw $exception;
         } finally {
@@ -181,7 +189,11 @@ class SwooleClient extends SyncClient
                         $channel->push($exception, 0.001);
                     }
                 }
-                $this->close();
+                try {
+                    $this->close();
+                } catch (Throwable $cleanupException) {
+                    // Waiters and the callback must observe the original read failure.
+                }
                 $callback = $this->getConfig()->getExceptionCallback();
                 if ($callback) {
                     $callback($exception);
